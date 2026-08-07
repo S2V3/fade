@@ -1,0 +1,48 @@
+{
+  "status": "pass1_complete_retries_pending",
+  "n_problems": 1500,
+  "pass1_correct": 282,
+  "pass1_accuracy": 0.188,
+  "final_correct": 282,
+  "final_accuracy": 0.188,
+  "recovered_by_retry": 0,
+  "final_pool_size": 133,
+  "iterations": [],
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "split": "train",
+  "retry_mode": "typed",
+  "pass1_diagnosis_distribution": {
+    "UNCLASSIFIED": 694,
+    "SM": 165,
+    "NR": 178,
+    "CE": 287,
+    "ST": 7
+  },
+  "per_category_accuracy": {
+    "monetary": {
+      "correct": 88,
+      "total": 428,
+      "acc": 0.205607476635514
+    },
+    "time": {
+      "correct": 90,
+      "total": 529,
+      "acc": 0.17013232514177692
+    },
+    "counting": {
+      "correct": 25,
+      "total": 183,
+      "acc": 0.1366120218579235
+    },
+    "percentage": {
+      "correct": 49,
+      "total": 219,
+      "acc": 0.2237442922374429
+    },
+    "rate": {
+      "correct": 21,
+      "total": 102,
+      "acc": 0.20588235294117646
+    }
+  }
+}
