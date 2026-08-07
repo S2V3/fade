@@ -1,0 +1,164 @@
+diff --git a/generation.py b/generation.py
+index 5e5da4f..4bbc11e 100644
+--- a/generation.py
++++ b/generation.py
+@@ -198,9 +198,15 @@ _EX_BLOCK_RE = re.compile(
+     r"(?=\n\nExample \d+:|\n\nQuestion:|\Z)", re.DOTALL)
+ 
+ 
+-def _to_chat_prompt(tokenizer, prompt: str) -> str:
++def _to_chat_prompt(tokenizer, prompt: str, extra_system: str = "") -> str:
+     """Re-wrap an assembled completion prompt using the model's chat template.
+ 
++    `extra_system` carries any per-attempt directive (e.g. a typed retry
++    instruction). It goes into the SYSTEM message, never into the body: text
++    inserted between the exemplar block and the live 'Question:' breaks
++    _EX_BLOCK_RE's lookahead, which silently swallowed the live question into the
++    last exemplar's answer and left the model solving an exemplar instead.
++
+     Few-shot exemplars are emitted as REAL DIALOGUE TURNS (user asks, assistant
+     solves) rather than pasted into one giant user message. Chat models were
+     fine-tuned on alternating turns, so multi-turn few-shot is markedly more
+@@ -213,6 +219,16 @@ def _to_chat_prompt(tokenizer, prompt: str) -> str:
+         system, body = _HEADER.strip(), prompt[len(_HEADER):]
+     else:
+         system, body = _SYSTEM_DEFAULT, prompt
++    if extra_system:
++        system = system + "\n" + extra_system.strip()
++
++    # DEFENSIVE NORMALISATION: _EX_BLOCK_RE only ends an exemplar at '\n\nQuestion:'.
++    # Strategies that put a preamble before the live question ('Now solve:\nQuestion:'
++    # -- sid 3 and 13) leave only a SINGLE newline there, so the lookahead never fired
++    # and the live question was absorbed into the previous exemplar's solution.
++    # Promoting every '\nQuestion:' to '\n\nQuestion:' restores the boundary. Harmless
++    # inside the 'Example N:\nQuestion:' header, which matches via '\s*'.
++    body = re.sub(r"(?<!\n)\nQuestion:", "\n\nQuestion:", body)
+ 
+     msgs = [{"role": "system", "content": system}]
+ 
+@@ -225,11 +241,26 @@ def _to_chat_prompt(tokenizer, prompt: str) -> str:
+             msgs.append({"role": "assistant", "content": sol})
+         last_end = m.end()
+ 
+-    # whatever remains is the live question (plus any typed instruction line)
+-    tail = body[last_end:].strip()
+-    tail = re.sub(r"^Question:\s*", "", tail)
+-    tail = re.sub(r"\n?Solution:\s*$", "", tail).strip()
+-    msgs.append({"role": "user", "content": tail or body.strip()})
++    # The live question is whatever follows the LAST 'Question:' marker in what
++    # remains. Anchoring on the marker (rather than requiring the tail to START
++    # with it) tolerates any preamble a strategy chose to put there.
++    tail = body[last_end:]
++    qpos = tail.rfind("Question:")
++    if qpos != -1:
++        tail = tail[qpos + len("Question:"):]
++    tail = re.sub(r"\n?(?:Solution|Answer|Full solution|Let's think step by step\.?)"
++                  r"\s*:?\s*$", "", tail.strip()).strip()
++
++    # FAIL LOUD. The old code fell back to `body.strip()` here, which handed the
++    # model the entire prompt starting at 'Example 1: Question: ...' -- i.e. asked
++    # it to solve an EXEMPLAR. That silent fallback is why typed retries scored
++    # 0/179 on NR and 0/146 on SM. Never fall back again.
++    if not tail:
++        raise ValueError(
++            "chat re-wrap lost the live question -- refusing to send a prompt that "
++            "would ask the model to solve an exemplar. Prompt head: "
++            + repr(prompt[:200]))
++    msgs.append({"role": "user", "content": tail})
+ 
+     try:
+         return tokenizer.apply_chat_template(
+@@ -529,18 +560,39 @@ class ExemplarGenerator:
+         max_new_tokens       : int   = 512,
+         num_return_sequences : int   = 1,
+         return_logprobs      : bool  = False,
++        extra_system         : str   = "",
+     ) -> Tuple[List[str], Optional[List]]:
+         """
+         Run model.generate(). Returns (list_of_decoded_traces, logprobs_or_None).
+         Traces contain only the newly generated tokens (prompt stripped).
++
++        `extra_system` is a per-attempt directive (typed retry instruction). In
++        chat mode it becomes part of the system message; in completion mode it is
++        prepended to the prompt body. Either way it NEVER lands between the
++        exemplar block and the live question.
+         """
++        if CHAT_MODE:
++            encoded_prompt = _to_chat_prompt(self.tokenizer, prompt,
++                                             extra_system=extra_system)
++        elif extra_system:
++            # completion mode: put the directive in the header, above the
++            # exemplars, so the few-shot pattern stays contiguous.
++            encoded_prompt = (prompt[:len(_HEADER)] + extra_system.strip() + "\n\n"
++                              + prompt[len(_HEADER):]
++                              if prompt.startswith(_HEADER)
++                              else extra_system.strip() + "\n\n" + prompt)
++        else:
++            encoded_prompt = prompt
+         enc = self.tokenizer(
+-            _to_chat_prompt(self.tokenizer, prompt) if CHAT_MODE else prompt,
++            encoded_prompt,
+             return_tensors = "pt",
+             truncation     = True,
+             max_length     = 3072,
+         ).to(self.device)
+         prompt_len = enc['input_ids'].shape[1]
++        if prompt_len >= 3072:
++            print(f"  [!] prompt hit the {3072}-token truncation limit -- the live "
++                  f"question may have been cut. Reduce the exemplar budget.")
+ 
+         gen_kwargs = dict(
+             max_new_tokens          = max_new_tokens,
+diff --git a/kaggle_run.py b/kaggle_run.py
+index 652dc75..aae7de2 100644
+--- a/kaggle_run.py
++++ b/kaggle_run.py
+@@ -475,11 +475,20 @@ def select_generic_positives(pool, seeds, k):
+ 
+ 
+ def build_retry_prompt(problem, positives, instruction):
+-    """Hint-free retry: positives + (optional) one-line instruction + problem.
+-    NEVER the gold answer, NEVER 'you were wrong'."""
++    """Hint-free retry: positives + problem. NEVER the gold answer, NEVER
++    'you were wrong'. Returns (prompt, extra_system).
++
++    The typed instruction is NO LONGER inlined between the exemplar block and the
++    live question. Doing that broke generation._EX_BLOCK_RE's '\\n\\nQuestion:'
++    lookahead in chat mode: the live question got absorbed into the last
++    exemplar's answer and the model was handed an EXEMPLAR to solve. Measured
++    cost of that bug on the 1,500-problem train run -- grounding on typed retries
++    collapsed 0.89 -> 0.12, and NR/SM recovered 0 of 325. The instruction now
++    travels separately and is routed into the system message by
++    _run_model(extra_system=...)."""
+     block = G._fmt_exemplars(positives, len(positives))
+-    instr = (instruction + "\n") if instruction else ""
+-    return f"{G._HEADER}{block}{instr}Question: {problem}\nSolution:"
++    prompt = f"{G._HEADER}{block}Question: {problem}\nSolution:"
++    return prompt, (instruction or "")
+ 
+ 
+ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8):
+@@ -504,11 +513,21 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8):
+         instruction = ""
+         temperature = 0.8                      # must be >0 or greedy repeats
+ 
+-    prompt = build_retry_prompt(rec["question"], positives, instruction)
++    prompt, extra_system = build_retry_prompt(rec["question"], positives, instruction)
+     traces, _ = gen._run_model(prompt, temperature=temperature,
+                                max_new_tokens=max_new_tokens,
+-                               num_return_sequences=1, return_logprobs=False)
++                               num_return_sequences=1, return_logprobs=False,
++                               extra_system=extra_system)
+     trace = traces[0]
++
++    # ARM PARITY: pass-1 goes through gen.generate(), which ends with
++    # _ensure_hash_line() -- appending a canonical '#### N' when the model finished
++    # in prose. Retries call _run_model directly and used to skip it, so pass-1
++    # carried a '####' line 97.7% of the time versus 60.6% for retries. Retries
++    # were being scored through a strictly weaker answer path than pass-1, which
++    # depressed measured recovery in every arm. Apply the same normalisation here.
++    trace = G._ensure_hash_line(trace, G.extract_final_answer(trace))
++
+     comps, label, diag, _ = score_trace(rec["question"], trace,
+                                         rec["gold_solution"], rec["gold_answer"])
+     gen_tokens = len(gen.tokenizer.encode(trace)) if gen.tokenizer else len(trace.split())
