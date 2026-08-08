@@ -1,0 +1,16 @@
+{
+  "status": "pass1_complete_retries_pending",
+  "n_problems": 1500,
+  "pass1_correct": 295,
+  "pass1_accuracy": 0.19666666666666666,
+  "final_correct": 295,
+  "final_accuracy": 0.19666666666666666,
+  "recovered_by_retry": 0,
+  "final_pool_size": 154,
+  "iterations": [],
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "split": "train",
+  "retry_mode": "typed",
+  "pass1_diagnosis_distribution": {},
+  "per_category_accuracy": {}
+}
