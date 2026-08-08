@@ -1,0 +1,70 @@
+{
+  "n_questions": 300,
+  "k": 5,
+  "temperature": 0.8,
+  "kappa_full_space": 0.23685539532012773,
+  "kappa_full_detail": {
+    "kappa": 0.23685539532012773,
+    "P_observed": 0.45599999999999985,
+    "P_expected": 0.28716,
+    "n_items": 300,
+    "n_ratings": 1500,
+    "categories": [
+      "CORRECT",
+      "NR",
+      "ST",
+      "SM",
+      "CE",
+      "UNCLASSIFIED"
+    ],
+    "marginals": {
+      "CORRECT": 0.1673,
+      "NR": 0.1087,
+      "ST": 0.0113,
+      "SM": 0.1073,
+      "CE": 0.1407,
+      "UNCLASSIFIED": 0.4647
+    },
+    "interpretation": "fair"
+  },
+  "kappa_failure_type": 0.22392872013399512,
+  "kappa_failure_detail": {
+    "kappa": 0.22392872013399512,
+    "P_observed": 0.5146282973621101,
+    "P_expected": 0.3745784501628597,
+    "n_items": 278,
+    "n_ratings": 1236,
+    "categories": [
+      "NR",
+      "ST",
+      "SM",
+      "CE",
+      "UNCLASSIFIED"
+    ],
+    "marginals": {
+      "NR": 0.1311,
+      "ST": 0.0138,
+      "SM": 0.1278,
+      "CE": 0.1683,
+      "UNCLASSIFIED": 0.5591
+    },
+    "interpretation": "fair"
+  },
+  "n_questions_with_2plus_wrong": 278,
+  "cohen_kappa_s1_vs_s2": {
+    "kappa": 0.23475303393367858,
+    "p_observed": 0.45,
+    "p_expected": 0.2812777777777778,
+    "n": 300,
+    "interpretation": "fair"
+  },
+  "mean_modal_share": 0.6566666666666666,
+  "mean_entropy_bits": 1.0137748983436667,
+  "all_samples_agree": 36,
+  "accuracy_at_1": 0.16333333333333333,
+  "majority_at_k": 0.22666666666666666,
+  "pass_at_k": 0.4066666666666667,
+  "verdict": "WEAKLY STABLE",
+  "advice": "kappa=0.224. Some reproducible signal, fair at best. A predictor could in principle reach ~0.22 agreement -- report the ceiling alongside the gate, and only build the predictor if that margin is worth the claim.",
+  "caveat": "Measured at T=0.80. Stability is temperature-dependent; a greedy (T=0) run is deterministic and would trivially give kappa=1, which is why this uses the same sampling regime a real deployment would."
+}
