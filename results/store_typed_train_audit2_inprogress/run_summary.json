@@ -1,0 +1,56 @@
+{
+  "status": "pass1_complete_retries_pending",
+  "n_problems": 1500,
+  "pass1_correct": 432,
+  "pass1_accuracy": 0.288,
+  "final_correct": 432,
+  "final_accuracy": 0.288,
+  "recovered_by_retry": 0,
+  "final_pool_size": 255,
+  "iterations": [],
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "split": "train",
+  "retry_mode": "typed",
+  "pass1_diagnosis_distribution": {
+    "AL": 94,
+    "UNCLASSIFIED": 88,
+    "WP": 254,
+    "SM": 253,
+    "TR": 56,
+    "CE": 136,
+    "NR": 73,
+    "ST": 114
+  },
+  "per_category_accuracy": {
+    "counting": {
+      "correct": 202,
+      "total": 694,
+      "acc": 0.2910662824207493
+    },
+    "time": {
+      "correct": 88,
+      "total": 347,
+      "acc": 0.25360230547550433
+    },
+    "monetary": {
+      "correct": 116,
+      "total": 334,
+      "acc": 0.3473053892215569
+    },
+    "logic": {
+      "correct": 5,
+      "total": 25,
+      "acc": 0.2
+    },
+    "rate": {
+      "correct": 20,
+      "total": 98,
+      "acc": 0.20408163265306123
+    },
+    "percentage": {
+      "correct": 1,
+      "total": 2,
+      "acc": 0.5
+    }
+  }
+}
