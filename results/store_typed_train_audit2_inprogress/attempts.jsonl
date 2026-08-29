@@ -888,3 +888,16 @@
 {"id": "p1_00888", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "AL"}
 {"id": "p1_00889", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "AL"}
 {"id": "p1_00890", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "SM"}
+{"id": "p1_00891", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "UNCLASSIFIED"}
+{"id": "p1_00892", "pass_": 1, "label": "MEDIUM_WRONG", "correct": false, "diagnosis": "WP"}
+{"id": "p1_00893", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "ST"}
+{"id": "p1_00894", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "SM"}
+{"id": "p1_00895", "pass_": 1, "label": "MEDIUM_WRONG", "correct": false, "diagnosis": "WP"}
+{"id": "p1_00896", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "SM"}
+{"id": "p1_00897", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "WP"}
+{"id": "p1_00898", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "ST"}
+{"id": "p1_00899", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "SM"}
+{"id": "p1_00900", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00901", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00902", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "SM"}
+{"id": "p1_00903", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
