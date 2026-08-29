@@ -1,0 +1,106 @@
+{
+  "strategy_id": 2,
+  "strategy_name": "few_shot",
+  "generation_version": "v5-hashline",
+  "embedding_backend": "minilm",
+  "retrieval": "3stage",
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "split": "train",
+  "retry_mode": "typed",
+  "exemplar_budget": 8,
+  "n_problems": 1500,
+  "eval_offset": 0,
+  "eval_range": [
+    1,
+    1500
+  ],
+  "pass1_correct": 308,
+  "pass1_accuracy": 0.2053,
+  "final_correct": 363,
+  "final_accuracy": 0.242,
+  "recovered_by_retry": 55,
+  "pool_entries_from_retry": 0,
+  "final_pool_size": 170,
+  "pass1_diagnosis_distribution": {
+    "UNCLASSIFIED": 713,
+    "SM": 168,
+    "NR": 183,
+    "CE": 296,
+    "ST": 7
+  },
+  "extraction_diagnostics": {
+    "traces_with_hash": 1353,
+    "hash_natively_emitted": 0,
+    "highE_but_wrong": 84,
+    "gold_in_trace_but_wrong": 139
+  },
+  "iterations": [
+    {
+      "iter": 1,
+      "MEDIUM": {
+        "retried": 133,
+        "transitions": {
+          "BAD_WRONG": 94,
+          "MEDIUM_WRONG": 30,
+          "MEDIUM_CORRECT": 9
+        },
+        "newly_correct": 9,
+        "pool_entries": 0,
+        "recovery_by_prior_diagnosis": {
+          "UNCLASSIFIED": 8,
+          "CE": 1
+        }
+      },
+      "BAD": {
+        "retried": 1059,
+        "transitions": {
+          "BAD_WRONG": 969,
+          "MEDIUM_WRONG": 44,
+          "MEDIUM_CORRECT": 46
+        },
+        "newly_correct": 46,
+        "pool_entries": 0,
+        "recovery_by_prior_diagnosis": {
+          "UNCLASSIFIED": 39,
+          "CE": 6,
+          "ST": 1
+        }
+      },
+      "retry_worthiness_gap": 0.0242
+    }
+  ],
+  "per_category_accuracy": {
+    "counting": {
+      "correct": 27,
+      "total": 188,
+      "acc": 0.1436
+    },
+    "monetary": {
+      "correct": 91,
+      "total": 443,
+      "acc": 0.2054
+    },
+    "percentage": {
+      "correct": 51,
+      "total": 227,
+      "acc": 0.2247
+    },
+    "rate": {
+      "correct": 21,
+      "total": 103,
+      "acc": 0.2039
+    },
+    "time": {
+      "correct": 92,
+      "total": 539,
+      "acc": 0.1707
+    }
+  },
+  "cost": {
+    "generations": 0,
+    "approx_tokens": 0,
+    "sec_per_generation": 0.49,
+    "wall_seconds": 0,
+    "projected_full_gsm8k_gpu_hours": 1.01
+  }
+}
