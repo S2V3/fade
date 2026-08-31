@@ -573,7 +573,51 @@ def _type_fit_score(rec, ftype) -> float:
     return 0.0
 
 
-def select_typed_positives(pool, ftype, seeds, k):
+def _retrieve(question, candidates, k, ftype=None):
+    """[AUDIT D39] Question-aware retrieval for the RETRY path.
+
+    Routes through the same 3-stage retriever pass-1 uses (relevance ->
+    complexity re-rank -> MMR diversity), with the structural-shape blend and the
+    type-match bonus. Passing ftype makes it prefer exemplars that exemplify the
+    cure for that failure; passing None makes it the untyped control. Both arms
+    therefore get topical relevance and differ only by the thing under test.
+    """
+    try:
+        from exemplar_selector import ExemplarSelector
+        sel = ExemplarSelector(pool_size=len(candidates) or 1)
+        ft = ftype.value if hasattr(ftype, "value") else ftype
+        if ft is None:
+            return list(sel.get_exemplars_3stage(question, candidates, k))
+
+        # [AUDIT D40] Over-sample by relevance, then RE-RANK by type fit.
+        #
+        # _typed_candidates passes 100% of the pool for ST and CE, 87% for WP and
+        # 82% for AL, so filtering-then-retrieving leaves the typed arm identical
+        # to generic apart from the instruction. Blending a continuous type-fit
+        # score into the ranking makes typing discriminate even where the boolean
+        # filter does not.
+        over = max(k, int(k * getattr(config, "RETRY_TYPEFIT_OVERSAMPLE", 4)))
+        short = list(sel.get_exemplars_3stage(
+            question, candidates, min(over, len(candidates)), ftype=ft))
+        if len(short) <= k:
+            return short[:k]
+
+        fits = [_type_fit_score(r, ftype) for r in short]
+        lo, hi = min(fits), max(fits)
+        span = (hi - lo) or 1.0
+        n = len(short)
+        w = float(getattr(config, "RETRY_W_TYPEFIT", 0.45))
+        # relevance is encoded as position in `short` (0 = most relevant)
+        order = sorted(range(n), key=lambda i: -(
+            (1.0 - w) * (1.0 - i / max(n - 1, 1)) + w * ((fits[i] - lo) / span)))
+        return [short[i] for i in order[:k]]
+    except Exception as e:
+        print(f"  [D39] retrieval unavailable ({type(e).__name__}: {e}), "
+              f"falling back to question-blind selection")
+        return []
+
+
+def select_typed_positives(pool, ftype, seeds, k, question=None):
     """Typed positives for a diagnosed failure, drawn from the GOOD pool FIRST
     (the model's own successes), then TOPPED UP FROM SEEDS (gold exemplars) that
     match the same structural type. This is the design doc's specified cold-start
@@ -581,9 +625,20 @@ def select_typed_positives(pool, ftype, seeds, k):
     generic and the headline comparison cannot run. Seeds are gold, so they
     trivially satisfy the structural criteria; using them as typed positives is
     honest and reported, not gold-answer leakage (the retry stays hint-free)."""
-    # [AUDIT] RANK, don't just filter -- see _type_fit_score.
-    cand = sorted(_typed_candidates(pool, ftype),
-                  key=lambda r: _type_fit_score(r, ftype), reverse=True)
+    # [AUDIT D39] question-aware first: rank the TYPE-ELIGIBLE pool by relevance
+    # to THIS question, not by type-fit alone. Without it every retry of a given
+    # type saw the same 8 exemplars.
+    cand = []
+    if question and getattr(config, "RETRY_QUESTION_AWARE", False):
+        eligible = _typed_candidates(pool, ftype)
+        if len(eligible) >= k:
+            cand = _retrieve(question, eligible, k, ftype)
+        elif pool:
+            cand = _retrieve(question, list(pool), k, ftype)
+    if not cand:
+        # [AUDIT] RANK, don't just filter -- see _type_fit_score.
+        cand = sorted(_typed_candidates(pool, ftype),
+                      key=lambda r: _type_fit_score(r, ftype), reverse=True)
     if len(cand) < k:                          # top up with type-matched seeds
         have = {rec.get("question") for rec in cand}
         for rec in sorted(_typed_candidates(seeds, ftype),
@@ -602,11 +657,19 @@ def select_typed_positives(pool, ftype, seeds, k):
     return cand[:k]
 
 
-def select_generic_positives(pool, seeds, k):
-    """Generic (untyped) positives: similarity-agnostic recent GOOD, topped up
-    from seeds. This is the ABLATION control for typed positives -- same count,
-    same retry, but exemplars NOT matched to the diagnosed type."""
-    cand = list(pool)[-k:]
+def select_generic_positives(pool, seeds, k, question=None):
+    """Generic (untyped) positives -- the ABLATION control for typed positives:
+    same count, same retry, same retrieval, but NOT matched to the diagnosed type.
+
+    [AUDIT D39] This used to take the LAST k of the pool, identically for every
+    problem. Both arms are now retrieved by question similarity so the ablation
+    isolates typing rather than comparing two topically irrelevant prompts."""
+    cand = []
+    if (question and getattr(config, "RETRY_QUESTION_AWARE", False)
+            and getattr(config, "GENERIC_QUESTION_AWARE", True) and pool):
+        cand = _retrieve(question, list(pool), k, ftype=None)
+    if not cand:
+        cand = list(pool)[-k:]
     if len(cand) < k:
         have = {rec.get("question") for rec in cand}
         for rec in seeds:
@@ -656,7 +719,8 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     ftype = (FailureType(rec["diagnosis"]) if rec.get("diagnosis")
              else FailureType.UNCLASSIFIED)
     if mode in ("typed", "typed+neg"):
-        positives = select_typed_positives(pool, ftype, seeds, budget)
+        positives = select_typed_positives(pool, ftype, seeds, budget,
+                                           question=rec["question"])
         instruction = TYPED_INSTRUCTION.get(ftype, "")
         temperature = 0.0
         if mode == "typed+neg" and negatives is not None and n_neg > 0:
@@ -664,9 +728,14 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
             if w:
                 instruction = (instruction + "\n\n" + w) if instruction else w
     elif mode == "generic":
-        positives = select_generic_positives(pool, seeds, budget)
+        # PURITY: the control arm gets retrieval and nothing else. No ftype, no
+        # type-fit re-rank, no instruction, no failure-mode warning. Anything
+        # typed leaking in here makes the ablation meaningless.
+        positives = select_generic_positives(pool, seeds, budget,
+                                             question=rec["question"])
         instruction = ""
         temperature = 0.0
+        assert not instruction, "generic arm must carry no instruction"
     else:  # immediate -- blind re-sample of the original few-shot prompt
         positives = seeds[:budget]
         instruction = ""
