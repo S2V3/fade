@@ -57,7 +57,5 @@
   "VALUE_MATCH_TOL": 1e-06,
   "V_MAX": 0.85,
   "V_MIN": 0.4,
-  "WP_ENABLED": true,
-  "FADE_FORKED_FROM": "/kaggle/working/stores/store_typed_train_audit2",
-  "FADE_ARM": "deferred-only"
+  "WP_ENABLED": true
 }
