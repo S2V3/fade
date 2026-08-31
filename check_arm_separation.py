@@ -56,8 +56,17 @@ def main():
         raise SystemExit(f"empty pool in {a.store}")
     print(f"pool: {len(pool)} gold-stripped exemplars\n")
 
-    gen_ex = select_generic_positives(pool, [], a.budget)
-    typed = {t: select_typed_positives(pool, FailureType(t), [], a.budget) for t in TYPES}
+    # [AUDIT D39/D40] Exercise the question-aware path -- selection now depends on
+    # the question, so a single question-free call no longer describes what the
+    # arms actually send. A representative question is drawn from the pool.
+    probe_q = next((r.get("question") for r in pool if r.get("question")), "")
+    gen_ex = select_generic_positives(pool, [], a.budget, question=probe_q)
+    typed = {t: select_typed_positives(pool, FailureType(t), [], a.budget,
+                                       question=probe_q) for t in TYPES}
+    print(f"probe question: {probe_q[:70]}...")
+    print("(overlap is now measured for ONE question; typed and generic share\n"
+          " relevant exemplars by design, so a non-zero overlap is expected --\n"
+          " what matters is that it is well below the full budget.)\n")
 
     print("=" * 70)
     print("  1 · TYPED vs GENERIC  (exemplar overlap out of %d)" % a.budget)

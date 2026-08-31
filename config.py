@@ -298,3 +298,65 @@ RETRIEVAL_W_TYPEMATCH = 0.5
 # vectorizer per call, so vectors are not comparable across calls and retrieval
 # silently degrades to noise. Fail loudly instead.
 REQUIRE_MINILM = True
+
+
+# [AUDIT D39] The RETRY path was question-blind.
+#
+# select_typed_positives(pool, ftype, seeds, k) took no `question` argument, so
+# EVERY retry of a given failure type received the IDENTICAL 8 exemplars, and
+# select_generic_positives took the last 8 of the pool for every problem alike.
+# Measured on the 1,500-problem run, mean TF-IDF similarity between the retried
+# question and its 8 exemplars:
+#
+#     typed selection (type-fit only)     0.0059
+#     generic selection (last 8)          0.0046
+#     similarity retrieval (top-8)        0.0778   <- what PASS-1 already got
+#
+# The retry therefore handed the model exemplars 13x LESS topically relevant than
+# the prompt that had just failed, and the typed-vs-generic comparison was
+# between two flavours of irrelevant. Result: typed 40.3% vs generic 39.3%,
+# McNemar p = 0.37.
+#
+# With this True, both arms retrieve by question similarity through
+# exemplar_selector.get_exemplars_3stage, and the arms differ by exactly the
+# thing under test: whether ftype (and the typed instruction) is supplied.
+# Set False to reproduce the question-blind behaviour.
+RETRY_QUESTION_AWARE = True          # revert: False
+
+
+# [AUDIT D40] Type-fit must RANK, because the eligibility filter barely filters.
+#
+# _typed_candidates() passes 100% of the pool for ST and CE, 87% for WP, 82% for
+# AL. For those types "type-eligible" means "everything", so filtering-then-
+# retrieving leaves the typed arm identical to generic apart from a one-line
+# instruction -- which is exactly what the ablation measured (typed 40.3% vs
+# generic 39.3%, p=0.37).
+#
+# The fix: over-sample a relevance shortlist, then re-rank it by a blend of
+# relevance position and _type_fit_score, so type-fit discriminates even when the
+# boolean filter does not.
+RETRY_TYPEFIT_OVERSAMPLE = 4         # shortlist = 4 x budget, then re-rank
+RETRY_W_TYPEFIT = 0.45               # 0 = pure relevance, 1 = pure type-fit
+
+# [AUDIT D40] Procedural typed instructions.
+# The originals were single clauses ("Verify each computation.") that named the
+# failure without saying what to DO. 'procedural' gives a short, checkable
+# procedure per type. Revert with 'short'.
+TYPED_INSTRUCTION_STYLE = "procedural"   # revert: "short"
+
+
+# [AUDIT D40] Should the CONTROL arm also retrieve by question?
+#
+# It is a separate switch from RETRY_QUESTION_AWARE because it decides what the
+# typed-vs-generic comparison actually measures:
+#
+#   True  (default)  both arms retrieve by question; they differ ONLY by ftype,
+#                    the type-fit re-rank and the typed instruction. A typed win
+#                    is attributable to TYPING.
+#   False            generic stays question-blind (last k of the pool). A typed
+#                    win then confounds typing with retrieval, and a reviewer can
+#                    fairly say the result only shows that retrieval works.
+#
+# The pre-fix generic run (typed 40.3% vs generic 39.3%, p=0.374) is already the
+# question-blind comparison, so setting this False re-runs an arm you have.
+GENERIC_QUESTION_AWARE = True        # revert: False

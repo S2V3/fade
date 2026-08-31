@@ -94,8 +94,13 @@ class FailureType(str, Enum):
 
 
 # The one-line hint-free typed instructions. NEVER reveal the answer.
-TYPED_INSTRUCTION = {
-    FailureType.TR: "",   # re-generate; nothing to instruct
+# [AUDIT D40] The original one-clause instructions are kept as _SHORT. They named
+# the failure but never said what to do about it, and the typed-vs-generic
+# ablation could not distinguish them from no instruction at all. The procedural
+# set below states a checkable procedure instead. config.TYPED_INSTRUCTION_STYLE
+# selects between them.
+TYPED_INSTRUCTION_SHORT = {
+    FailureType.TR: "",
     FailureType.NR: "Restate what the question asks and list its given numbers before solving.",
     FailureType.AL: "Compute a number on every line. Do not write relations between named quantities.",
     FailureType.ST: "Compute and write out every intermediate value the problem needs, one per line.",
@@ -104,6 +109,80 @@ TYPED_INSTRUCTION = {
     FailureType.WP: "Decide what quantity the question asks for before you compute anything.",
     FailureType.UNCLASSIFIED: "",
 }
+
+TYPED_INSTRUCTION_PROCEDURAL = {
+    FailureType.TR: "",          # a truncation artefact -- nothing to instruct
+    FailureType.NR: (
+        "Do not give the answer straight away.\n"
+        "1. Write one line naming the quantity the question asks for.\n"
+        "2. Write one line listing every number the question gives.\n"
+        "3. Then compute, one operation per line, and end with '#### <number>'."),
+    FailureType.AL: (
+        "Do not introduce letters or variables, and do not write a relation you "
+        "then leave unsolved.\n"
+        "Every line must end in a number you have actually worked out. Where you "
+        "would write 'let x be ...', compute that quantity directly from the "
+        "numbers the question gives."),
+    FailureType.ST: (
+        "Show every intermediate quantity on its own line, including the obvious "
+        "ones.\n"
+        "Do not combine two operations into a single line, and do not jump from "
+        "the given numbers to the answer. Each line shows one operation and its "
+        "result."),
+    FailureType.SM: (
+        "Use only the numbers the question actually states.\n"
+        "1. First copy out those numbers on one line.\n"
+        "2. If you need a quantity the question does not give, derive it and show "
+        "the derivation before using it.\n"
+        "Never introduce a value that appears nowhere in the question."),
+    FailureType.CE: (
+        "Work one operation per line and check each result before using it.\n"
+        "Do not round: if a division is not exact, keep the exact fraction or the "
+        "full decimal and carry it into the next line unchanged."),
+    FailureType.WP: (
+        "Decide the target before you compute.\n"
+        "1. Write 'We need to find: <the exact quantity the question asks for>'.\n"
+        "2. Work out which steps lead to that quantity.\n"
+        "3. Compute them in order, and make sure your last line reports that same "
+        "quantity -- not an intermediate one."),
+    FailureType.UNCLASSIFIED: "",
+}
+
+
+def _instruction_table():
+    """Selected at call time so config can be changed without reimporting."""
+    import config as _cfg
+    style = getattr(_cfg, "TYPED_INSTRUCTION_STYLE", "short")
+    return (TYPED_INSTRUCTION_PROCEDURAL if style == "procedural"
+            else TYPED_INSTRUCTION_SHORT)
+
+
+class _InstructionView(dict):
+    """dict-like, but resolves through config on every read, so existing callers
+    that do TYPED_INSTRUCTION.get(ftype, "") pick up the configured style."""
+    def get(self, key, default=""):
+        return _instruction_table().get(key, default)
+
+    def __getitem__(self, key):
+        return _instruction_table()[key]
+
+    def __iter__(self):
+        return iter(_instruction_table())
+
+    def items(self):
+        return _instruction_table().items()
+
+    def keys(self):
+        return _instruction_table().keys()
+
+    def values(self):
+        return _instruction_table().values()
+
+    def __len__(self):
+        return len(_instruction_table())
+
+
+TYPED_INSTRUCTION = _InstructionView()
 
 # What the typed positive exemplars look like.
 TYPED_CURE = {

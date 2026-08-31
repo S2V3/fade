@@ -76,6 +76,10 @@ def main():
     ap.add_argument("--predictor", help="fst_type.joblib (required for --arm fst)")
     ap.add_argument("--gate", help="fst_recover.joblib -- rank questions by predicted "
                                    "recoverability and cure only the top --budget")
+    ap.add_argument("--negatives", type=int, default=0,
+                    help="k failure-mode warnings drawn from the wrong-trace bank "
+                         "(0 = off). They go in the SYSTEM message, never in the "
+                         "exemplar block -- see negatives.py.")
     ap.add_argument("--budget", type=float, default=1.0,
                     help="fraction of problems to cure when --gate is given (default 1.0 = all)")
     ap.add_argument("--pool-store", required=True, help="the TRAIN store holding pool.jsonl")
@@ -127,6 +131,17 @@ def main():
               f"{len(cure_ids)}/{len(problems)}; the rest get plain retrieval")
         print(f"        (gate AUROC on train: {g.train_report.get('auroc')})")
 
+    negbank = None
+    if a.negatives > 0:
+        from negatives import NegativeBank
+        negbank = NegativeBank.from_store(a.pool_store)
+        n_neg = sum(len(v) for v in negbank.by_type.values())
+        print(f"  negative bank: {n_neg} wrong traces, "
+              f"{len(negbank.by_type)} types -> {a.negatives} warning(s) per prompt")
+        if a.arm != "fst":
+            print("  note: --negatives has no effect on the baseline arm (no type "
+                  "is predicted, so there is nothing to warn about)")
+
     pred = None
     if a.arm == "fst":
         from fst_predictor import FSTPredictor
@@ -146,6 +161,7 @@ def main():
     snap = {k: getattr(config, k) for k in dir(config)
             if k.isupper() and isinstance(getattr(config, k), (int, float, str, bool))}
     snap["FADE_ARM"] = a.arm
+    snap["FADE_N_NEGATIVES"] = a.negatives
     (root / config.CONFIG_SNAPSHOT_FILE).write_text(json.dumps(snap, indent=2))
     results_path = root / config.RESULTS_FILE
 
@@ -181,11 +197,13 @@ def main():
         pcount[ptype or ("OUT_OF_BUDGET" if not in_budget else "ABSTAIN/none")] += 1
 
         if a.arm == "fst" and in_budget:
-            positives, instruction = cure_for(ptype, pool, seeds, a.exemplar_budget)
+            positives, instruction = cure_for(
+                ptype, pool, seeds, a.exemplar_budget,
+                question=q, negatives=negbank, n_neg=a.negatives)
         else:
             from kaggle_run import select_generic_positives
             positives, instruction = select_generic_positives(
-                pool, seeds, a.exemplar_budget), ""
+                pool, seeds, a.exemplar_budget, question=q), ""
 
         prompt, extra = K.build_retry_prompt(q, positives, instruction)
         traces, _ = gen._run_model(prompt, temperature=0.0,
@@ -208,6 +226,7 @@ def main():
                            else "generic (baseline)")),
             "in_budget": in_budget,
             "instruction": instruction, "n_exemplars": len(positives),
+            "n_negatives": (a.negatives if (a.arm == "fst" and in_budget) else 0),
             "trace": trace, "trace_scored": scored, "hash_appended": happ,
             "signals": comps.signals(), "label": label.value,
             "diagnosis": diag.ftype.value if diag else None,
