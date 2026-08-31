@@ -586,8 +586,14 @@ def _retrieve(question, candidates, k, ftype=None):
         from exemplar_selector import ExemplarSelector
         sel = ExemplarSelector(pool_size=len(candidates) or 1)
         ft = ftype.value if hasattr(ftype, "value") else ftype
+
+        def _order(xs):
+            # [AUDIT D42] most relevant LAST, nearest the live question.
+            return list(reversed(xs)) if getattr(
+                config, "RETRY_RELEVANCE_LAST", False) else list(xs)
+
         if ft is None:
-            return list(sel.get_exemplars_3stage(question, candidates, k))
+            return _order(sel.get_exemplars_3stage(question, candidates, k))
 
         # [AUDIT D40] Over-sample by relevance, then RE-RANK by type fit.
         #
@@ -600,7 +606,7 @@ def _retrieve(question, candidates, k, ftype=None):
         short = list(sel.get_exemplars_3stage(
             question, candidates, min(over, len(candidates)), ftype=ft))
         if len(short) <= k:
-            return short[:k]
+            return _order(short[:k])
 
         fits = [_type_fit_score(r, ftype) for r in short]
         lo, hi = min(fits), max(fits)
@@ -610,7 +616,7 @@ def _retrieve(question, candidates, k, ftype=None):
         # relevance is encoded as position in `short` (0 = most relevant)
         order = sorted(range(n), key=lambda i: -(
             (1.0 - w) * (1.0 - i / max(n - 1, 1)) + w * ((fits[i] - lo) / span)))
-        return [short[i] for i in order[:k]]
+        return _order([short[i] for i in order[:k]])
     except Exception as e:
         print(f"  [D39] retrieval unavailable ({type(e).__name__}: {e}), "
               f"falling back to question-blind selection")
@@ -654,7 +660,18 @@ def select_typed_positives(pool, ftype, seeds, k, question=None):
                 cand.append(rec)
                 if len(cand) >= k:
                     break
-    return cand[:k]
+    out = cand[:k]
+
+    # [AUDIT D41] Swap the LAST slot for a demonstration of the cure. Last, not
+    # first, so the most relevant retrieved exemplar keeps the position the model
+    # attends to most, and the demo sits closest to the live question. One slot is
+    # replaced, never added, so typed and generic still show exactly k exemplars.
+    if getattr(config, "TYPED_APPROACH_DEMO", False):
+        from diagnosis import approach_demo
+        demo = approach_demo(ftype)
+        if demo is not None and len(out) >= 1:
+            out = out[:k - 1] + [demo]
+    return out
 
 
 def select_generic_positives(pool, seeds, k, question=None):
@@ -748,12 +765,29 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
         temperature = 0.8                       # must be > 0 or greedy repeats
 
     prompt, extra_system = build_retry_prompt(rec["question"], positives, instruction)
+
+    # [AUDIT D43] Typed-only prefill: end the prompt mid-sentence so the model has
+    # to complete it. Generic and immediate get "" and are byte-identical to before.
+    prefill = ""
+    if mode in ("typed", "typed+neg"):
+        from diagnosis import prefill_for
+        prefill = prefill_for(ftype)
+        if prefill:
+            prompt = prompt + " " + prefill
+
     traces, _ = gen._run_model(prompt, temperature=temperature,
                                max_new_tokens=max_new_tokens,
                                num_return_sequences=1, return_logprobs=False,
                                extra_system=extra_system,
                                problem=rec["question"])   # [AUDIT D2] integrity
     trace = traces[0]
+    if prefill:
+        # Stitch the prefill back on, or every downstream signal (n_steps, the
+        # equation chain, G_score) would read a trace missing its opening words,
+        # and the stored trace would not be what the model actually produced.
+        head = prefill.strip()
+        if head and not trace.lstrip().startswith(head[:24]):
+            trace = head + (" " if not head.endswith("\n") else "") + trace.lstrip()
 
     # ARM PARITY: pass-1 goes through gen.generate(), which ends with
     # _ensure_hash_line() -- appending a canonical '#### N' when the model finished
@@ -763,6 +797,47 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     # depressed measured recovery in every arm. Apply the same normalisation here.
     trace, _hash_appended = G.ensure_hash_line_flagged(
         trace, G.extract_final_answer(trace))   # [AUDIT D34] measured, not inferred
+
+    # [AUDIT D44] Type-conditioned acceptance test. GOLD-FREE -- it reads only the
+    # question and the new trace, so it is legal on any split. If the cure did not
+    # take, resample once and keep whichever candidate passes.
+    n_resampled = 0
+    accept_ok, accept_why = True, ""
+    if mode in ("typed", "typed+neg"):
+        from diagnosis import cure_took
+        accept_ok, accept_why = cure_took(ftype, rec["question"], trace, rec.get("trace"))
+        if not accept_ok:
+            alt, _ = gen._run_model(
+                prompt, temperature=float(getattr(config, "ACCEPT_RESAMPLE_TEMP", 0.7)),
+                max_new_tokens=max_new_tokens, num_return_sequences=1,
+                return_logprobs=False, extra_system=extra_system,
+                problem=rec["question"])
+            alt_trace = alt[0]
+            if prefill:
+                _h = prefill.strip()
+                if _h and not alt_trace.lstrip().startswith(_h[:24]):
+                    alt_trace = _h + (" " if not _h.endswith("\n") else "") + alt_trace.lstrip()
+            alt_trace, _ = G.ensure_hash_line_flagged(
+                alt_trace, G.extract_final_answer(alt_trace))
+            n_resampled = 1
+            alt_ok, _ = cure_took(ftype, rec["question"], alt_trace, rec.get("trace"))
+            if alt_ok:                       # the resample passed; the first did not
+                trace, accept_ok, accept_why = alt_trace, True, ""
+    elif mode == "generic" and getattr(config, "GENERIC_MATCH_RESAMPLE", False):
+        # COMPUTE PARITY: generic has no test, so it resamples at the same RATE,
+        # chosen at random, and keeps the second draw. Without this typed gets more
+        # generations and a reviewer can attribute the win to compute rather than
+        # to the diagnosis.
+        import random as _rnd
+        rate = float(getattr(config, "GENERIC_RESAMPLE_RATE", 0.0))
+        if rate > 0 and _rnd.Random(hash(rec["id"]) & 0xFFFFFFFF).random() < rate:
+            alt, _ = gen._run_model(
+                prompt, temperature=float(getattr(config, "ACCEPT_RESAMPLE_TEMP", 0.7)),
+                max_new_tokens=max_new_tokens, num_return_sequences=1,
+                return_logprobs=False, extra_system=extra_system,
+                problem=rec["question"])
+            trace, _ = G.ensure_hash_line_flagged(alt[0], G.extract_final_answer(alt[0]))
+            n_resampled = 1
 
     comps, label, diag, _ = score_trace(rec["question"], trace,
                                         rec["gold_solution"], rec["gold_answer"])

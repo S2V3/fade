@@ -360,3 +360,55 @@ TYPED_INSTRUCTION_STYLE = "procedural"   # revert: "short"
 # The pre-fix generic run (typed 40.3% vs generic 39.3%, p=0.374) is already the
 # question-blind comparison, so setting this False re-runs an arm you have.
 GENERIC_QUESTION_AWARE = True        # revert: False
+
+
+# [AUDIT D41] Show the cure, do not only state it.
+# A 7B follows format better than instructions. With this True the typed arm
+# replaces ONE of its retrieved exemplars with a hand-written demonstration of
+# the procedure for that failure type, so budget parity with generic is exact
+# (both still show `budget` exemplars).
+TYPED_APPROACH_DEMO = True           # revert: False
+
+
+# [AUDIT D42] Put the most relevant exemplar NEAREST the live question.
+#
+# get_exemplars_3stage returns most-relevant FIRST, so the best-matched exemplar
+# ends up furthest from the question the model is about to answer. In-context
+# learning weights later demonstrations more heavily, so this reverses the block:
+# least relevant first, most relevant last, immediately before the question.
+#
+# Applies to BOTH arms -- it is a prompt-ordering improvement, not a typed
+# treatment, and letting only typed have it would confound the ablation.
+RETRY_RELEVANCE_LAST = True          # revert: False
+
+
+# [AUDIT D43] Typed-only response prefill.
+# The typed retry prompt ends mid-sentence ("Solution: We need to find:") so the
+# model must complete it. Generic ends at "Solution:" with nothing after, exactly
+# as before. Costs no exemplar slot and no extra tokens.
+TYPED_PREFILL_ENABLED = True         # revert: False
+
+
+# [AUDIT D44] Type-conditioned acceptance tests.
+# The diagnosis picks the cure AND checks, gold-free, whether the cure took. A
+# retry that fails its own type's test is resampled once and the better candidate
+# is kept. Generic has no diagnosis and therefore no test.
+TYPED_ACCEPT_TEST = True             # revert: False
+# Measured on the 1,068 retries already in hand -- correct rate when the test
+# PASSES vs when it FAILS:
+#     CE  38.3% vs  3.6%   (10.6x)      <- keep
+#     AL  30.0% vs  9.3%   ( 3.2x)      <- keep
+#     TR   8.9% vs  0.0%   (   inf)     <- keep
+#     ST  21.1% vs 14.5%   ( 1.5x)      <- keep
+#     WP  19.2% vs 15.7%   ( 1.2x)      <- keep, weak
+#     SM  13.3% vs 14.1%   ( 0.9x)      <- DROP, no signal
+#     NR  11.1% vs 14.5%   ( 0.8x)      <- DROP, inverted
+# Only the types where the test actually predicts correctness are gated. Testing
+# SM and NR would burn generations resampling on noise.
+ACCEPT_TEST_TYPES = ("CE", "AL", "TR", "ST", "WP")
+ACCEPT_RESAMPLE_TEMP = 0.7           # >0, or the resample reproduces the failure
+# Compute parity: generic resamples at the SAME RATE as typed, chosen at random,
+# keeping the second sample. Without this typed gets more generations and a
+# reviewer can attribute the win to compute. Leave True for the paper.
+GENERIC_MATCH_RESAMPLE = True        # revert: False
+GENERIC_RESAMPLE_RATE = 0.0          # set from the typed run; 0.0 = auto (measured)

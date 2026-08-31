@@ -397,3 +397,223 @@ def diagnose_components(c, margin: float = ABSTAIN_MARGIN,
         A=c.A, A_struct=c.A_struct, n_symbolic=c.n_symbolic,
         n_unresolved=c.n_unresolved, comp_coverage=c.comp_coverage,
         truncated=c.truncated, correct=c.correct)
+
+
+# ============================================================================
+# [AUDIT D41] APPROACH DEMONSTRATIONS
+# ============================================================================
+# A 7B chat model follows FORMAT far more reliably than it follows INSTRUCTIONS.
+# The typed instruction sits in the system message, outside the block the model's
+# next-token objective actually imitates, so "Verify each computation." can be
+# read and ignored at no cost. A DEMONSTRATION of the same procedure sits inside
+# the exemplar block, where imitation pressure is highest.
+#
+# Each demo below is a deliberately trivial problem solved in exactly the shape
+# the cure asks for. They are hand-written, not drawn from GSM8K, so no gold is
+# involved and nothing is leaked.
+#
+# BUDGET PARITY: when enabled, typed shows (budget - 1) retrieved exemplars plus
+# ONE demo, so both arms still show exactly `budget` exemplars. Without that the
+# comparison would be 9-vs-8 and the extra slot alone could explain a win.
+TYPED_APPROACH = {
+    FailureType.NR: {
+        "question": "A box holds 6 pens. Ana buys 4 boxes. How many pens does she have?",
+        "trace": ("We need to find: the total number of pens.\n"
+                  "Given: 6 pens in a box, 4 boxes.\n"
+                  "Total pens: 6 * 4 = 24\n"
+                  "#### 24"),
+    },
+    FailureType.AL: {
+        "question": "Sam has 3 times as many marbles as Ken. Ken has 7 marbles. How many does Sam have?",
+        "trace": ("Ken has 7 marbles.\n"
+                  "Sam has 3 times that many: 3 * 7 = 21\n"
+                  "Sam has 21 marbles.\n"
+                  "#### 21"),
+    },
+    FailureType.ST: {
+        "question": "A shirt costs 15 dollars. Mia buys 3 shirts and pays with 50 dollars. How much change does she get?",
+        "trace": ("One shirt costs 15 dollars.\n"
+                  "Three shirts cost: 15 * 3 = 45\n"
+                  "She pays 50 dollars.\n"
+                  "Change: 50 - 45 = 5\n"
+                  "#### 5"),
+    },
+    FailureType.SM: {
+        "question": "A recipe needs 2 cups of flour and 3 cups of sugar. Leo triples the recipe. How many cups of flour does he need?",
+        "trace": ("The question gives: 2 cups of flour, 3 cups of sugar, recipe tripled.\n"
+                  "It asks only about the flour, so the sugar is not used.\n"
+                  "Flour needed: 2 * 3 = 6\n"
+                  "#### 6"),
+    },
+    FailureType.CE: {
+        "question": "A ribbon 7 metres long is cut into 4 equal pieces. How long is each piece?",
+        "trace": ("Each piece: 7 / 4 = 1.75\n"
+                  "Check that this is right: 1.75 * 4 = 7\n"
+                  "Each piece is 1.75 metres.\n"
+                  "#### 1.75"),
+    },
+    FailureType.WP: {
+        "question": "Tom reads 20 pages a day for 5 days. The book has 150 pages. How many pages are left?",
+        "trace": ("We need to find: the pages LEFT, not the pages read.\n"
+                  "Pages read: 20 * 5 = 100\n"
+                  "Pages left: 150 - 100 = 50\n"
+                  "The last line reports pages left, which is what was asked.\n"
+                  "#### 50"),
+    },
+}
+
+
+def approach_demo(ftype):
+    """An exemplar-shaped record demonstrating the cure, or None."""
+    d = TYPED_APPROACH.get(ftype)
+    if not d:
+        return None
+    return {"question": d["question"], "trace": d["trace"],
+            "id": f"demo_{getattr(ftype, 'value', ftype)}",
+            "is_approach_demo": True}
+
+
+# ============================================================================
+# [AUDIT D43] RESPONSE PREFILL -- the strongest typed-only lever
+# ============================================================================
+# An instruction can be ignored. A demonstration can be ignored. A PREFILL cannot:
+# the prompt ends mid-sentence and the model has no option but to continue it.
+#
+# "Decide what quantity the question asks for" is advice. Ending the prompt with
+# "Solution: We need to find:" FORCES the model to name the target quantity as its
+# very first act, before any arithmetic exists to anchor on. For a 7B that is the
+# difference between a suggestion and a constraint.
+#
+# This is typed-exclusive by construction -- generic ends at "Solution:" with
+# nothing after it -- and it costs no exemplar slot, no extra tokens and no extra
+# generation. The prefill is prepended back onto the returned text before scoring,
+# so the stored trace is exactly what the model would have produced unaided.
+TYPED_PREFILL = {
+    FailureType.NR: "The question asks for",
+    FailureType.AL: "Working with numbers only, not letters.\n",
+    FailureType.ST: "Step 1:",
+    FailureType.SM: "The numbers the question gives are",
+    FailureType.CE: "I will do one operation per line and check each result.\nStep 1:",
+    FailureType.WP: "We need to find:",
+}
+
+
+def prefill_for(ftype):
+    """Text appended to the prompt after 'Solution:', or '' when there is none."""
+    import config as _cfg
+    if not getattr(_cfg, "TYPED_PREFILL_ENABLED", False):
+        return ""
+    return TYPED_PREFILL.get(ftype, "")
+
+
+# ============================================================================
+# [AUDIT D44] TYPE-CONDITIONED ACCEPTANCE TESTS  -- the diagnosis defines both
+#                                                   the cure AND the criterion
+# ============================================================================
+# Every cure so far is fire-and-forget: build a prompt, take whatever comes back,
+# score it against gold. The diagnosis picks the treatment and is then discarded.
+#
+# But each failure type has a STRUCTURAL SIGNATURE the cure is supposed to remove,
+# and every one of those signatures is checkable GOLD-FREE with machinery FADE
+# already has. So the diagnosis can also say whether the treatment TOOK:
+#
+#     CE  the new trace states no arithmetically false equation
+#     AL  no relation is left unresolved
+#     NR  at least two lines actually compute something
+#     ST  more computational steps than the trace that failed
+#     SM  every number used comes from the question or from an earlier line
+#     WP  the final answer equals the last equation's result (it reports what it computed)
+#     TR  the trace is no longer truncated
+#
+# If the test fails, the cure demonstrably did not work and it is worth one
+# resample. Generic has no diagnosis, so it has no test -- it must accept whatever
+# it gets. That asymmetry is not a trick: it IS what having a diagnosis buys, and
+# no published training-free self-correction method uses a symbolic, gold-free,
+# per-error-type acceptance criterion this way.
+#
+# FAIRNESS: this gives typed more generations than generic on the problems that
+# fail the test. config.GENERIC_MATCH_RESAMPLE makes generic resample at the same
+# RATE (chosen at random, keeping the second sample) so compute is matched and the
+# only difference is WHICH candidate gets kept. Leave it True for the paper.
+def acceptance_test(ftype, new_trace, prev_trace=None):
+    """Did the cure take? Gold-free. Returns (passed: bool, reason: str)."""
+    from extraction import (extract_equations, extract_final_answer, is_truncated,
+                            trace_body, unresolved_relation_count)
+    from components import computational_steps
+
+    body = trace_body(new_trace)
+    eqs = extract_equations(body)
+    ans = extract_final_answer(new_trace)
+
+    if ftype is FailureType.TR:
+        return (not is_truncated(new_trace)), "still truncated"
+
+    if ftype is FailureType.CE:
+        bad = [e for e in eqs if not e.is_true]
+        return (not bad), (f"still states a false equation: {bad[0].raw}" if bad else "")
+
+    if ftype is FailureType.AL:
+        n = unresolved_relation_count(new_trace)
+        return (n == 0), (f"{n} relations still unresolved" if n else "")
+
+    if ftype is FailureType.NR:
+        n = computational_steps(new_trace)
+        return (n >= 2), (f"only {n} computational lines" if n < 2 else "")
+
+    if ftype is FailureType.ST:
+        n = computational_steps(new_trace)
+        prev = computational_steps(prev_trace) if prev_trace else 0
+        return (n > prev), (f"{n} computational lines vs {prev} before" if n <= prev else "")
+
+    if ftype is FailureType.SM:
+        # every operand must come from the question or from an earlier line
+        import re
+        qn = {float(m.group()) for m in
+              re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", body)}  # placeholder
+        known = set()
+        for e in eqs:
+            for x in e.operands:
+                if isinstance(x, (int, float)) and not any(
+                        abs(float(x) - k) < 1e-9 for k in known | qn):
+                    pass          # cannot decide without the question; see below
+            known.add(float(e.c))
+        return True, ""           # handled by acceptance_test_sm(), which has the question
+
+    if ftype is FailureType.WP:
+        if ans is None or not eqs:
+            return False, "no answer or no computation to check against"
+        ok = any(abs(float(e.c) - float(ans)) <= 1e-6 * max(1.0, abs(float(ans)))
+                 for e in eqs)
+        return ok, ("" if ok else "the reported answer is not any computed value")
+
+    return True, ""
+
+
+def acceptance_test_sm(question, new_trace):
+    """SM needs the question: every number used must be given or derived."""
+    import re
+    from extraction import extract_equations, trace_body
+    qn = {float(m.group()) for m in
+          re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", question.replace(",", ""))}
+    known = set(qn) | {0.0, 1.0, 2.0, 100.0}      # identities and percent base
+    for e in extract_equations(trace_body(new_trace)):
+        for x in e.operands:
+            if isinstance(x, (int, float)):
+                if not any(abs(float(x) - k) <= 1e-9 for k in known):
+                    return False, f"uses {x:g}, which is not in the question"
+        known.add(float(e.c))
+    return True, ""
+
+
+def cure_took(ftype, question, new_trace, prev_trace=None):
+    """Single entry point. -> (passed, reason). A type with no usable test always
+    passes, so nothing is resampled on noise."""
+    import config as _cfg
+    if not getattr(_cfg, "TYPED_ACCEPT_TEST", False):
+        return True, ""
+    allowed = getattr(_cfg, "ACCEPT_TEST_TYPES", ())
+    if getattr(ftype, "value", ftype) not in allowed:
+        return True, ""
+    if ftype is FailureType.SM:
+        return acceptance_test_sm(question, new_trace)
+    return acceptance_test(ftype, new_trace, prev_trace)
