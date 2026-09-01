@@ -541,7 +541,12 @@ def approach_demo(ftype):
 TYPED_PREFILL = {
     # [AUDIT D57] NR and ST prefills now open the SHAPE their redirect
     # instruction asks for, instead of an unrelated opening.
-    FailureType.NR: "answer =",
+    # [AUDIT D59] NR's prefill was "answer =", which invites "answer = 24" -- a
+    # bare number, which IS the NR failure. Measured: NR traces came back as
+    # 'answer = To find out how much Mike will have...' and NR stayed negative
+    # (-4.1 vs generic). The numbers are injected instead, as for SM, so the
+    # cheapest continuation is an expression over them rather than a guess.
+    FailureType.NR: "The numbers the question gives are",
     FailureType.AL: "Working with numbers only, not letters.\n",
     FailureType.ST: "",   # the shape is set by the instruction and the demo
     FailureType.SM: "The numbers the question gives are",
@@ -592,11 +597,14 @@ def prefill_for(ftype, question=None):
     if not getattr(_cfg, "TYPED_PREFILL_ENABLED", False):
         return ""
     base = TYPED_PREFILL.get(ftype, "")
-    if (ftype is FailureType.SM and question
+    if (ftype in (FailureType.SM, FailureType.NR) and question
             and getattr(_cfg, "SM_INJECT_QUESTION_NUMBERS", False)):
         nums = question_numbers_phrase(question)
         if nums:
-            return f"{base} {nums}. Use only these values and what follows from them.\n"
+            tail = ("Use only these values and what follows from them.\n"
+                    if ftype is FailureType.SM
+                    else "Write the expression over these values, then evaluate it.\n")
+            return f"{base} {nums}. {tail}"
     return base
 
 
@@ -791,3 +799,18 @@ def cure_type_for(ftype, trace):
     if computational_steps(trace or "") < 2:
         return FailureType.NR, "abstained; no computation -> NR cure"
     return FailureType.UNCLASSIFIED, "abstained; no signature -> generic cure"
+
+
+# [AUDIT D63] How the failure is NAMED to the model. Phrased as "a previous
+# attempt", never "you were wrong": the retry stays hint-free, it carries no gold
+# answer, and there is no evidence that scolding a 7B helps.
+FAILURE_MODE_PHRASE = {
+    FailureType.NR: "gave a number without showing any working",
+    FailureType.AL: "left a relation written but never solved it for a number",
+    FailureType.ST: "jumped from the given numbers to the answer",
+    FailureType.SM: "used a value that the question never gives",
+    FailureType.CE: "followed the right plan but slipped on the arithmetic",
+    FailureType.WP: "computed a different quantity from the one asked for",
+    FailureType.TR: "",
+    FailureType.UNCLASSIFIED: "",
+}

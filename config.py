@@ -336,7 +336,7 @@ RETRY_QUESTION_AWARE = True          # revert: False
 # relevance position and _type_fit_score, so type-fit discriminates even when the
 # boolean filter does not.
 RETRY_TYPEFIT_OVERSAMPLE = 4         # shortlist = 4 x budget, then re-rank
-RETRY_W_TYPEFIT = 0.45               # 0 = pure relevance, 1 = pure type-fit
+RETRY_W_TYPEFIT = 0.70               # 0 = pure relevance, 1 = pure type-fit; revert: 0.45
 
 # [AUDIT D40] Procedural typed instructions.
 # The originals were single clauses ("Verify each computation.") that named the
@@ -565,7 +565,22 @@ UNCLASSIFIED_FALLBACK_CURE = True    # revert: False
 # room for typing to differ. Note that even at FLOOR=0 only 2.6 exemplars
 # differed -- the exemplar channel was never the large lever; the instruction,
 # the prefill and the symbolic repair are.
-RETRY_RELEVANCE_FLOOR = 3            # of 8 slots; revert: 0 (pure re-rank)
+# [AUDIT D62] Re-tuned now that both arms share ONE shortlist (D55c). Measured
+# over 60 problems -- type-selected exemplars against relevance versus generic:
+#
+#     FLOOR  W_TYPEFIT   type-selected   typed rel vs generic
+#         3      0.45         1.4                +1%
+#         2      0.45         1.6                +1%
+#         3      0.70         2.4                -4%
+#         2      0.70         2.8                -6%
+#         1      0.70         3.1                -8%
+#
+# floor=3/W=0.45 left only 1.4 of 8 exemplars actually chosen by type -- typed and
+# generic were near-identical on the exemplar channel, so the whole treatment
+# rested on the instruction, prefill, demo and repair. floor=2/W=0.70 doubles the
+# type-selected count while typed stays within a few percent of generic on
+# relevance, which is the property D55 was protecting.
+RETRY_RELEVANCE_FLOOR = 2            # of 8 slots; revert: 3
 
 
 # [AUDIT D60] A retry that reproduces the failed answer is worthless -- resample it.
@@ -597,3 +612,24 @@ RETRY_RELEVANCE_FLOOR = 3            # of 8 slots; revert: 0 (pure re-rank)
 RETRY_RESAMPLE_IF_UNCHANGED = True   # revert: False
 UNCHANGED_RESAMPLE_TEMP = 0.8        # must be >0 or the resample repeats verbatim
 UNCHANGED_MAX_RESAMPLES = 1
+
+
+# [AUDIT D63] Layered prompt: general examples first, then type-matched, then the
+# question. This is the structure the exemplar block can express SAFELY.
+#
+# The obvious implementation -- writing "the previous attempt failed like this"
+# between the exemplars and the question -- is exactly the [D1/D2] bug. Exemplars
+# are parsed by generation._EX_BLOCK_RE into real dialogue turns; free text inside
+# the block breaks the '\n\nQuestion:' lookahead, the live question gets swallowed
+# into the last exemplar's answer, and the model solves an exemplar instead.
+# Measured cost when that happened: grounding 0.89 -> 0.12, and 0 of 325 NR/SM
+# failures recovered.
+#
+# So the layering is carried by ORDER, which costs nothing and cannot break the
+# parse:
+#     [ relevance-retrieved, ascending ] [ type-selected ] [ cure demonstration ]
+#                                                          ^ nearest the question
+# and the failure mode is NAMED in the system message, where the instruction
+# already lives and where no parser is looking.
+RETRY_LAYERED_ORDER = True           # revert: False (most-relevant-last)
+RETRY_NAME_FAILURE_MODE = True       # prepend "a previous attempt ..." to the instruction

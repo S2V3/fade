@@ -632,16 +632,26 @@ def _retrieve(question, candidates, k, ftype=None):
         # away 14-30% of topical relevance on every type -- typed was handing the
         # model worse material than the control it was supposed to beat.
         floor = max(0, min(int(getattr(config, "RETRY_RELEVANCE_FLOOR", 0)), k))
+        base, typed_picks = [], []
         if floor:
-            chosen = list(range(min(floor, n)))          # most relevant first
-            seen = set(chosen)
-            for i in order:
-                if len(chosen) >= k:
-                    break
-                if i not in seen:
-                    chosen.append(i); seen.add(i)
-            return _order([short[i] for i in chosen[:k]])
-        return _order([short[i] for i in order[:k]])
+            base = list(range(min(floor, n)))            # guaranteed by relevance
+        seen = set(base)
+        for i in order:                                  # blended: relevance x type-fit
+            if len(base) + len(typed_picks) >= k:
+                break
+            if i not in seen:
+                typed_picks.append(i); seen.add(i)
+
+        if getattr(config, "RETRY_LAYERED_ORDER", False):
+            # [AUDIT D63] Keep the two groups SEPARATE and in order: the
+            # relevance-retrieved exemplars first (what a generic arm would show),
+            # then the type-selected ones, then -- added by the caller -- the cure
+            # demonstration, nearest the live question. Without this grouping the
+            # blend interleaves them and there is no layering for the system
+            # message's "the last examples show the right approach" to point at.
+            base_sorted = sorted(base, reverse=True)     # ascending relevance
+            return [short[i] for i in base_sorted + typed_picks][:k]
+        return _order([short[i] for i in (base + typed_picks)[:k]])
     except Exception as e:
         print(f"  [D39] retrieval unavailable ({type(e).__name__}: {e}), "
               f"falling back to question-blind selection")
@@ -706,10 +716,16 @@ def select_typed_positives(pool, ftype, seeds, k, question=None):
         from diagnosis import approach_demo
         demo = approach_demo(ftype)
         if demo is not None and len(out) >= 1:
-            if getattr(config, "RETRY_RELEVANCE_LAST", False):
-                out = [demo] + out[1:k]          # drop the least relevant (front)
+            if getattr(config, "RETRY_LAYERED_ORDER", False):
+                # [AUDIT D63] general -> type-matched -> demonstration -> question.
+                # _retrieve already returns the shared, relevance-ranked exemplars
+                # ahead of the type-selected ones, so only the demo has to move to
+                # the end, where it sits closest to the live question.
+                out = out[:k - 1] + [demo]
+            elif getattr(config, "RETRY_RELEVANCE_LAST", False):
+                out = [demo] + out[1:k]
             else:
-                out = out[:k - 1] + [demo]       # least relevant is at the back
+                out = out[:k - 1] + [demo]
     return out
 
 
@@ -788,6 +804,16 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                                            question=rec["question"])
         instruction = TYPED_INSTRUCTION.get(ftype, "")
         temperature = 0.0
+        # [AUDIT D63] Name the failure mode in the SYSTEM message -- the one place
+        # a per-attempt directive can go without touching the exemplar parser.
+        if (instruction and getattr(config, "RETRY_NAME_FAILURE_MODE", False)):
+            from diagnosis import FAILURE_MODE_PHRASE
+            _ph = FAILURE_MODE_PHRASE.get(ftype, "")
+            if _ph:
+                instruction = (
+                    f"A previous attempt at this question {_ph}. "
+                    "The last examples above show the right approach for that.\n\n"
+                    + instruction)
         if mode == "typed+neg" and negatives is not None and n_neg > 0:
             w = negatives.warning_for(rec["question"], ftype.value, k=n_neg)
             if w:
