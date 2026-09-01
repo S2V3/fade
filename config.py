@@ -342,7 +342,13 @@ RETRY_W_TYPEFIT = 0.45               # 0 = pure relevance, 1 = pure type-fit
 # The originals were single clauses ("Verify each computation.") that named the
 # failure without saying what to DO. 'procedural' gives a short, checkable
 # procedure per type. Revert with 'short'.
-TYPED_INSTRUCTION_STYLE = "procedural"   # revert: "short"
+# [AUDIT D56] "redirect" replaced "procedural" as the default. The procedural
+# instructions demanded effort ("check each result", "show every step") and the
+# model complied by computing LESS: CE halved its false equations and lost 12.5
+# points, AL did the same, NR and SM moved the wrong way outright. The only cure
+# that gained asks for a DECISION (WP, +7.1). Redirecting instructions name a
+# different artefact to produce instead of asking for more care.
+TYPED_INSTRUCTION_STYLE = "redirect"     # options: redirect | procedural | short
 
 
 # [AUDIT D40] Should the CONTROL arm also retrieve by question?
@@ -488,3 +494,34 @@ SM_INJECT_QUESTION_NUMBERS = True    # revert: False
 # the worst-performing group at ~8-9% recovery. The RECORDED diagnosis stays
 # UNCLASSIFIED, so the abstain rate the paper reports is unchanged.
 UNCLASSIFIED_FALLBACK_CURE = True    # revert: False
+
+
+# [AUDIT D55] Typed must be generic PLUS typing, never generic REPLACED by typing.
+#
+# select_typed_positives re-ranked a relevance shortlist by a blend of relevance
+# and _type_fit_score, which DISPLACED the best-matched exemplars. Measured mean
+# question-exemplar similarity, typed against generic on the same questions:
+#
+#     WP -22%   SM -22%   CE -30%   ST -25%   AL -14%   NR -14%
+#
+# Typed was handing the model materially worse exemplars than the control on
+# every single type, and paying for it with a type-fit score that for CE barely
+# varies at all (sd/|mean| = 0.11, because 3.0*V is constant over a pool where
+# every exemplar is already correct). CE is typed's worst type and this is why.
+#
+# RETRY_RELEVANCE_FLOOR guarantees the top-N most relevant exemplars survive the
+# re-rank. Typed then contains generic's best N, and typing decides only the
+# remaining slots. Generic can no longer beat typed on exemplar quality, which is
+# the property that makes "typed is generic plus a treatment" actually true.
+# The knob, measured (40 problems, mean over WP/CE/SM/ST):
+#     FLOOR   typed rel   vs generic   exemplars that differ
+#         0      0.0991        -4%              2.6 of 8   <- the shipped bug
+#         2      0.1060        +3%              2.5
+#         3      0.1088        +5%              2.3        <- default
+#         5      0.1099        +6%              1.8
+#         7      0.1105        +7%              1.0
+# 3 keeps typed comfortably above generic on relevance while leaving the most
+# room for typing to differ. Note that even at FLOOR=0 only 2.6 exemplars
+# differed -- the exemplar channel was never the large lever; the instruction,
+# the prefill and the symbolic repair are.
+RETRY_RELEVANCE_FLOOR = 3            # of 8 slots; revert: 0 (pure re-rank)

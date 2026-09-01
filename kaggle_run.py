@@ -592,8 +592,19 @@ def _retrieve(question, candidates, k, ftype=None):
             return list(reversed(xs)) if getattr(
                 config, "RETRY_RELEVANCE_LAST", False) else list(xs)
 
+        # [AUDIT D55c] BOTH arms build the SAME shortlist, with the same size and
+        # no ftype. get_exemplars_3stage ends in an MMR diversity pass whose
+        # result depends on how many exemplars are being chosen, so asking for 8
+        # and asking for 32 give different top-8s. Generic was getting top-8-of-8
+        # and typed the first-8-of-32, which is why typed still trailed by 3-14%
+        # even after the shortlist stopped being type-biased. One shortlist, one
+        # procedure, and the arms differ only in what they do with it.
+        over = max(k, int(k * getattr(config, "RETRY_TYPEFIT_OVERSAMPLE", 4)))
+        short = list(sel.get_exemplars_3stage(
+            question, candidates, min(over, len(candidates))))
+
         if ft is None:
-            return _order(sel.get_exemplars_3stage(question, candidates, k))
+            return _order(short[:k])
 
         # [AUDIT D40] Over-sample by relevance, then RE-RANK by type fit.
         #
@@ -602,9 +613,7 @@ def _retrieve(question, candidates, k, ftype=None):
         # to generic apart from the instruction. Blending a continuous type-fit
         # score into the ranking makes typing discriminate even where the boolean
         # filter does not.
-        over = max(k, int(k * getattr(config, "RETRY_TYPEFIT_OVERSAMPLE", 4)))
-        short = list(sel.get_exemplars_3stage(
-            question, candidates, min(over, len(candidates)), ftype=ft))
+        # Typing is applied in exactly ONE place: the re-rank of the tail below.
         if len(short) <= k:
             return _order(short[:k])
 
@@ -616,6 +625,22 @@ def _retrieve(question, candidates, k, ftype=None):
         # relevance is encoded as position in `short` (0 = most relevant)
         order = sorted(range(n), key=lambda i: -(
             (1.0 - w) * (1.0 - i / max(n - 1, 1)) + w * ((fits[i] - lo) / span)))
+
+        # [AUDIT D55] Keep the top-FLOOR by pure relevance no matter what the
+        # re-rank says, so typed always contains generic's best exemplars and
+        # typing only decides the remaining slots. Without this the blend threw
+        # away 14-30% of topical relevance on every type -- typed was handing the
+        # model worse material than the control it was supposed to beat.
+        floor = max(0, min(int(getattr(config, "RETRY_RELEVANCE_FLOOR", 0)), k))
+        if floor:
+            chosen = list(range(min(floor, n)))          # most relevant first
+            seen = set(chosen)
+            for i in order:
+                if len(chosen) >= k:
+                    break
+                if i not in seen:
+                    chosen.append(i); seen.add(i)
+            return _order([short[i] for i in chosen[:k]])
         return _order([short[i] for i in order[:k]])
     except Exception as e:
         print(f"  [D39] retrieval unavailable ({type(e).__name__}: {e}), "
@@ -806,7 +831,8 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                                       "symbolic_repair": True,
                                       "symbolic_repair_post": False,
                                       "cure_type": ftype.value,
-                                      "cure_note": _cure_note}
+                                      "cure_note": _cure_note,
+                                      "instruction_sent": ""}   # repaired, never prompted
             return _trace, _c, _l, _d, 0, len(positives), False
 
     prompt, extra_system = build_retry_prompt(rec["question"], positives, instruction)
@@ -927,7 +953,10 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                               "accept_reason": accept_why, "prefill": prefill,
                               "symbolic_repair": False,
                               "symbolic_repair_post": _post_repair,
-                              "cure_type": ftype.value, "cure_note": _cure_note}
+                              "cure_type": ftype.value, "cure_note": _cure_note,
+                              # [AUDIT D54] the instruction ACTUALLY SENT, including
+                              # the failure-mode warning appended in typed+neg.
+                              "instruction_sent": instruction}
     return trace, comps, label, diag, gen_tokens, len(positives), _hash_appended
 
 
@@ -1350,12 +1379,20 @@ def run_full(gen, manual, eval_problems, strategy_id, n_problems,
                     solved.add(rec["id"])
                     if prev_diag:
                         recov_by_diag[prev_diag] += 1
-                # log the ACTUAL instruction used (empty for generic/immediate,
-                # typed only for typed) + the retry_mode, so each record is
-                # self-identifying. (Re-deriving from diagnosis was a logging bug.)
-                _logged_instr = (TYPED_INSTRUCTION.get(
-                    FailureType(prev_diag) if prev_diag else FailureType.UNCLASSIFIED, "")
-                    if retry_mode in ("typed", "typed+neg") else "")
+                # [AUDIT D54] Take the instruction from what retry_once ACTUALLY
+                # sent. Re-deriving it from prev_diagnosis was wrong twice over:
+                #   * a D52 reroute (cascade said UNCLASSIFIED, cure was CE) logged
+                #     UNCLASSIFIED's empty instruction while CE's was really sent --
+                #     which is why rerouted rows showed a cure_type of CE and no
+                #     cure text at all;
+                #   * typed+neg appends a failure-mode warning to the instruction,
+                #     and none of it was ever recorded.
+                _la = getattr(retry_once, "last_accept", None) or {}
+                _logged_instr = _la.get("instruction_sent")
+                if _logged_instr is None:            # older code path
+                    _logged_instr = (TYPED_INSTRUCTION.get(
+                        FailureType(prev_diag) if prev_diag else FailureType.UNCLASSIFIED, "")
+                        if retry_mode in ("typed", "typed+neg") else "")
                 # [AUDIT SELF-REVIEW] STORE BEFORE LOG. The retry path logged to
                 # results.jsonl first and only then called store.add, so a crash
                 # between the two left a `became_good` row in results.jsonl with
@@ -1372,7 +1409,9 @@ def run_full(gen, manual, eval_problems, strategy_id, n_problems,
                 log_detail(_detail_record(
                     phase="retry", iter=it, origin=origin, id=rec["id"],
                     retry_mode=retry_mode,
-                    **(getattr(retry_once, "last_accept", None) or {}),
+                    **{k: v for k, v in
+                       (getattr(retry_once, "last_accept", None) or {}).items()
+                       if k != "instruction_sent"},
                     question=rec["question"], gold_answer=rec["gold_answer"],
                     prev_label=rec["label"], prev_diagnosis=prev_diag,
                     typed_positives=npos, instruction=_logged_instr,

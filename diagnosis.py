@@ -149,12 +149,68 @@ TYPED_INSTRUCTION_PROCEDURAL = {
 }
 
 
+# [AUDIT D56] EFFORT-DEMANDING CURES BACKFIRE; REDIRECTING CURES DO NOT.
+#
+# Measured, typed vs generic on the signal each cure targets (1,068 retries):
+#
+#     type  cure targets           typed  generic  moved?      recovery
+#     CE    fewer false equations   0.23     0.49   YES         -12.5 pts
+#     AL    fewer unresolved rel.   1.21     1.65   YES          -5.3 pts
+#     TR    not truncated           0.02     0.14   YES          +5.4 pts
+#     ST    more computed lines     2.08     2.14   no           +4.4 pts
+#     NR    more computed lines     1.01     1.30   WRONG WAY    -8.2 pts
+#     SM    more equations          2.00     2.44   WRONG WAY    +0.0 pts
+#     WP    (which quantity)          --       --   --           +7.1 pts
+#
+# CE halved its false equations and lost 12.5 points. It obeyed "check each
+# computation" by computing LESS -- fewer equations means fewer false ones and
+# also fewer correct derivations. AL did the same. NR and SM, told to compute
+# MORE, produced LESS.
+#
+# The one cure that gained asks for a DECISION rather than for effort: WP
+# redirects which quantity to target without demanding more work. TR gains
+# because its fix is room, not care.
+#
+# These instructions are therefore written as REDIRECTIONS. Each names a
+# different ARTEFACT to produce; none says "be careful" or "show more steps".
+TYPED_INSTRUCTION_REDIRECT = {
+    FailureType.TR: "",
+    FailureType.NR: (
+        "Write the single arithmetic expression that answers the question, then "
+        "evaluate it.\n"
+        "Shape: 'answer = 6 * 4 = 24'."),
+    FailureType.AL: (
+        "Replace every named quantity with its number as soon as you introduce "
+        "it.\n"
+        "Where you would write 'let x be the cost', write the cost itself."),
+    FailureType.ST: (
+        "Write one line per operation, in the order the operations happen.\n"
+        "Shape: '<what it is> = <arithmetic> = <number>'."),
+    FailureType.SM: (
+        "Use only the numbers listed above and values you compute from them.\n"
+        "If a quantity you need is not listed, derive it from the listed ones on "
+        "its own line."),
+    FailureType.CE: (
+        "Write the whole calculation as one expression first, then evaluate it "
+        "once.\n"
+        "Shape: 'total = 11 + 20 + 7 = 38'."),
+    FailureType.WP: (
+        "Decide the target before you compute.\n"
+        "1. Write 'We need to find: <the exact quantity the question asks for>'.\n"
+        "2. Work out which steps lead to that quantity.\n"
+        "3. Compute them in order, and make sure your last line reports that same "
+        "quantity -- not an intermediate one."),
+    FailureType.UNCLASSIFIED: "",
+}
+
+
 def _instruction_table():
     """Selected at call time so config can be changed without reimporting."""
     import config as _cfg
     style = getattr(_cfg, "TYPED_INSTRUCTION_STYLE", "short")
-    return (TYPED_INSTRUCTION_PROCEDURAL if style == "procedural"
-            else TYPED_INSTRUCTION_SHORT)
+    return {"redirect": TYPED_INSTRUCTION_REDIRECT,
+            "procedural": TYPED_INSTRUCTION_PROCEDURAL}.get(
+                style, TYPED_INSTRUCTION_SHORT)
 
 
 class _InstructionView(dict):
@@ -416,41 +472,35 @@ def diagnose_components(c, margin: float = ABSTAIN_MARGIN,
 # ONE demo, so both arms still show exactly `budget` exemplars. Without that the
 # comparison would be 9-vs-8 and the extra slot alone could explain a win.
 TYPED_APPROACH = {
+    # [AUDIT D57] Demos rewritten to match the D56 redirect instructions. They
+    # previously demonstrated the PROCEDURAL cures, so the model was shown one
+    # shape and told to produce another.
     FailureType.NR: {
         "question": "A box holds 6 pens. Ana buys 4 boxes. How many pens does she have?",
-        "trace": ("We need to find: the total number of pens.\n"
-                  "Given: 6 pens in a box, 4 boxes.\n"
-                  "Total pens: 6 * 4 = 24\n"
+        "trace": ("total pens = 6 * 4 = 24\n"
                   "#### 24"),
     },
     FailureType.AL: {
         "question": "Sam has 3 times as many marbles as Ken. Ken has 7 marbles. How many does Sam have?",
-        "trace": ("Ken has 7 marbles.\n"
-                  "Sam has 3 times that many: 3 * 7 = 21\n"
-                  "Sam has 21 marbles.\n"
+        "trace": ("Ken's marbles = 7\n"
+                  "Sam's marbles = 3 * 7 = 21\n"
                   "#### 21"),
     },
     FailureType.ST: {
         "question": "A shirt costs 15 dollars. Mia buys 3 shirts and pays with 50 dollars. How much change does she get?",
-        "trace": ("One shirt costs 15 dollars.\n"
-                  "Three shirts cost: 15 * 3 = 45\n"
-                  "She pays 50 dollars.\n"
-                  "Change: 50 - 45 = 5\n"
+        "trace": ("cost of three shirts = 15 * 3 = 45\n"
+                  "change = 50 - 45 = 5\n"
                   "#### 5"),
     },
     FailureType.SM: {
         "question": "A recipe needs 2 cups of flour and 3 cups of sugar. Leo triples the recipe. How many cups of flour does he need?",
-        "trace": ("The question gives: 2 cups of flour, 3 cups of sugar, recipe tripled.\n"
-                  "It asks only about the flour, so the sugar is not used.\n"
-                  "Flour needed: 2 * 3 = 6\n"
+        "trace": ("flour needed = 2 * 3 = 6\n"
                   "#### 6"),
     },
     FailureType.CE: {
-        "question": "A ribbon 7 metres long is cut into 4 equal pieces. How long is each piece?",
-        "trace": ("Each piece: 7 / 4 = 1.75\n"
-                  "Check that this is right: 1.75 * 4 = 7\n"
-                  "Each piece is 1.75 metres.\n"
-                  "#### 1.75"),
+        "question": "Bella bought 11 snowflake stamps, 20 truck stamps and 7 rose stamps. How many stamps in all?",
+        "trace": ("total stamps = 11 + 20 + 7 = 38\n"
+                  "#### 38"),
     },
     FailureType.WP: {
         "question": "Tom reads 20 pages a day for 5 days. The book has 150 pages. How many pages are left?",
@@ -489,9 +539,11 @@ def approach_demo(ftype):
 # generation. The prefill is prepended back onto the returned text before scoring,
 # so the stored trace is exactly what the model would have produced unaided.
 TYPED_PREFILL = {
-    FailureType.NR: "The question asks for",
+    # [AUDIT D57] NR and ST prefills now open the SHAPE their redirect
+    # instruction asks for, instead of an unrelated opening.
+    FailureType.NR: "answer =",
     FailureType.AL: "Working with numbers only, not letters.\n",
-    FailureType.ST: "Step 1:",
+    FailureType.ST: "",   # the shape is set by the instruction and the demo
     FailureType.SM: "The numbers the question gives are",
     # [AUDIT D45] CE's prefill used to be
     #   "I will do one operation per line and check each result.\nStep 1:"
@@ -608,7 +660,13 @@ def acceptance_test(ftype, new_trace, prev_trace=None):
     # satisfied by computing less.
     n_new = computational_steps(new_trace)
     n_prev = computational_steps(prev_trace) if prev_trace else 0
-    degenerate = (n_prev > 0 and n_new < n_prev) or len(eqs) == 0
+    # [AUDIT D57] CE and NR are told (D56) to write ONE expression, so producing
+    # fewer lines than the failed trace is the cure working, not degeneracy. For
+    # them the floor is only "it computed something at all"; otherwise every CE
+    # retry failed its own test and burned a resample.
+    compressing = ftype in (FailureType.CE, FailureType.NR)
+    degenerate = (len(eqs) == 0) or (
+        not compressing and n_prev > 0 and n_new < n_prev)
 
     if ftype is FailureType.CE:
         bad = [e for e in eqs if not e.is_true]
