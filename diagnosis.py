@@ -493,17 +493,59 @@ TYPED_PREFILL = {
     FailureType.AL: "Working with numbers only, not letters.\n",
     FailureType.ST: "Step 1:",
     FailureType.SM: "The numbers the question gives are",
-    FailureType.CE: "I will do one operation per line and check each result.\nStep 1:",
+    # [AUDIT D45] CE's prefill used to be
+    #   "I will do one operation per line and check each result.\nStep 1:"
+    # which imposed a whole new structure on a trace whose PLAN was already
+    # correct -- CE means right plan, wrong arithmetic. The re-run showed CE
+    # traces losing a third of their equations (2.7 -> 1.8) and recovery
+    # collapsing. A CE cure must change how carefully the model computes, not how
+    # it lays the solution out, so there is no prefill for CE any more.
+    FailureType.CE: "",
     FailureType.WP: "We need to find:",
 }
 
 
-def prefill_for(ftype):
-    """Text appended to the prompt after 'Solution:', or '' when there is none."""
+def question_numbers_phrase(question: str, limit: int = 8) -> str:
+    """'48, 24 and 3' -- the numbers the question actually states."""
+    import re
+    seen, out = set(), []
+    # The trailing guard is (?!\d), not (?![\w.]). The stricter version dropped
+    # every number at the end of a sentence -- "She has 50." lost the 50 -- which
+    # is exactly the kind of given an SM failure then invents a replacement for.
+    for m in re.finditer(r"(?<![\w.])\d+(?:\.\d+)?(?!\d)",
+                         (question or "").replace(",", "")):
+        v = m.group()
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+        if len(out) >= limit:
+            break
+    if not out:
+        return ""
+    return out[0] if len(out) == 1 else ", ".join(out[:-1]) + " and " + out[-1]
+
+
+def prefill_for(ftype, question=None):
+    """Text appended to the prompt after 'Solution:', or '' when there is none.
+
+    [AUDIT D51] SM's prefill is COMPLETED for the model, not left open.
+    SM means the trace used a value the question never gave, and 70% of SM traces
+    do exactly that (177 of 253, measured). Asking the model to list the givens
+    leaves it free to hallucinate one at the very first step. Extracting them with
+    a regex and writing them into the prompt removes that opportunity entirely --
+    the model starts from a correct, complete list it did not have to produce.
+    """
     import config as _cfg
     if not getattr(_cfg, "TYPED_PREFILL_ENABLED", False):
         return ""
-    return TYPED_PREFILL.get(ftype, "")
+    base = TYPED_PREFILL.get(ftype, "")
+    if (ftype is FailureType.SM and question
+            and getattr(_cfg, "SM_INJECT_QUESTION_NUMBERS", False)):
+        nums = question_numbers_phrase(question)
+        if nums:
+            return f"{base} {nums}. Use only these values and what follows from them.\n"
+    return base
 
 
 # ============================================================================
@@ -536,7 +578,21 @@ def prefill_for(ftype):
 # RATE (chosen at random, keeping the second sample) so compute is matched and the
 # only difference is WHICH candidate gets kept. Leave it True for the paper.
 def acceptance_test(ftype, new_trace, prev_trace=None):
-    """Did the cure take? Gold-free. Returns (passed: bool, reason: str)."""
+    """Did the cure take? Gold-free. Returns (passed: bool, reason: str).
+
+    [AUDIT D45] EVERY test carries an anti-degeneracy guard.
+
+    The first version was gameable. "States no arithmetically false equation" is
+    satisfied most cheaply by stating NO equations, and "no unresolved relation"
+    by writing nothing at all. So when a greedy CE retry failed its test, the
+    temperature-0.7 resample that computed LESS passed it and was kept. Measured
+    on the partial re-run: CE recovery fell 26.6% -> 9.6% and equations per CE
+    trace fell 2.7 -> 1.8. The test was selecting traces that AVOID arithmetic
+    rather than traces that get it right.
+
+    Fix: a candidate must clear the type's criterion AND not compute less than the
+    trace it is replacing. A test that can be passed by doing less is not a test.
+    """
     from extraction import (extract_equations, extract_final_answer, is_truncated,
                             trace_body, unresolved_relation_count)
     from components import computational_steps
@@ -548,12 +604,23 @@ def acceptance_test(ftype, new_trace, prev_trace=None):
     if ftype is FailureType.TR:
         return (not is_truncated(new_trace)), "still truncated"
 
+    # [AUDIT D45] anti-degeneracy floor, shared by the tests that could be
+    # satisfied by computing less.
+    n_new = computational_steps(new_trace)
+    n_prev = computational_steps(prev_trace) if prev_trace else 0
+    degenerate = (n_prev > 0 and n_new < n_prev) or len(eqs) == 0
+
     if ftype is FailureType.CE:
         bad = [e for e in eqs if not e.is_true]
+        if degenerate:
+            return False, (f"degenerate: {len(eqs)} equations, {n_new} computed "
+                           f"lines vs {n_prev} before")
         return (not bad), (f"still states a false equation: {bad[0].raw}" if bad else "")
 
     if ftype is FailureType.AL:
         n = unresolved_relation_count(new_trace)
+        if degenerate:
+            return False, f"degenerate: {n_new} computed lines vs {n_prev} before"
         return (n == 0), (f"{n} relations still unresolved" if n else "")
 
     if ftype is FailureType.NR:
@@ -580,6 +647,8 @@ def acceptance_test(ftype, new_trace, prev_trace=None):
         return True, ""           # handled by acceptance_test_sm(), which has the question
 
     if ftype is FailureType.WP:
+        if degenerate:
+            return False, f"degenerate: {n_new} computed lines vs {n_prev} before"
         if ans is None or not eqs:
             return False, "no answer or no computation to check against"
         ok = any(abs(float(e.c) - float(ans)) <= 1e-6 * max(1.0, abs(float(ans)))
@@ -617,3 +686,50 @@ def cure_took(ftype, question, new_trace, prev_trace=None):
     if ftype is FailureType.SM:
         return acceptance_test_sm(question, new_trace)
     return acceptance_test(ftype, new_trace, prev_trace)
+
+
+# ============================================================================
+# [AUDIT D52] ABSTENTION IS RIGHT FOR THE TAXONOMY, WRONG FOR THE CURE
+# ============================================================================
+# UNCLASSIFIED is a deliberate design feature: a taxonomy that always fires
+# cannot be wrong, and the abstain class is what makes the per-type recovery
+# rates interpretable. That reasoning applies to REPORTING.
+#
+# It does not apply to choosing a cure. On the train run, 88 failures were
+# UNCLASSIFIED and every one of them received the generic cure with no
+# instruction -- the worst-performing group in the study, at ~8-9% recovery. But
+# 84% of them carry an obvious gold-free signature anyway:
+#
+#     looks CE (states a false equation)      66   75%
+#     looks AL (leaves a relation unresolved)  8    9%
+#     no signature                            14   16%
+#
+# So the cascade abstains, and the cure bank guesses. The RECORDED diagnosis
+# stays UNCLASSIFIED -- the taxonomy's honesty is preserved and the paper still
+# reports an abstain rate -- but the treatment is the matched one.
+def cure_type_for(ftype, trace):
+    """The type whose CURE should be applied. Equals `ftype` except for
+    UNCLASSIFIED, which is routed on trace evidence alone. Returns (ftype, note)."""
+    import config as _cfg
+    if ftype is not FailureType.UNCLASSIFIED:
+        return ftype, ""
+    if not getattr(_cfg, "UNCLASSIFIED_FALLBACK_CURE", False):
+        return ftype, ""
+    from extraction import extract_equations, trace_body, is_truncated, \
+        unresolved_relation_count
+    from components import computational_steps
+    eqs = extract_equations(trace_body(trace or ""))
+    # Order matters. is_truncated is the LOOSEST of these tests -- it fires on a
+    # trace that merely ends on a dangling word -- so checking it first swallowed
+    # cases with far stronger evidence. A stated-and-false equation, or an
+    # unresolved relation, is concrete; a dangling word is a heuristic. TR is
+    # therefore checked LAST, and only when nothing definite was found.
+    if any(not e.is_true for e in eqs):
+        return FailureType.CE, "abstained; false equation -> CE cure"
+    if unresolved_relation_count(trace or "") > 0:
+        return FailureType.AL, "abstained; unresolved relation -> AL cure"
+    if is_truncated(trace or ""):
+        return FailureType.TR, "abstained; truncated -> TR cure"
+    if computational_steps(trace or "") < 2:
+        return FailureType.NR, "abstained; no computation -> NR cure"
+    return FailureType.UNCLASSIFIED, "abstained; no signature -> generic cure"

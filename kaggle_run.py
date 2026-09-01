@@ -635,11 +635,15 @@ def select_typed_positives(pool, ftype, seeds, k, question=None):
     # to THIS question, not by type-fit alone. Without it every retry of a given
     # type saw the same 8 exemplars.
     cand = []
-    if question and getattr(config, "RETRY_QUESTION_AWARE", False):
-        eligible = _typed_candidates(pool, ftype)
-        if len(eligible) >= k:
-            cand = _retrieve(question, eligible, k, ftype)
-        elif pool:
+    if question and getattr(config, "RETRY_QUESTION_AWARE", False) and pool:
+        # [AUDIT D49] Retrieve over the WHOLE pool by default. The hard filter cost
+        # SM 42% of its topical relevance while being a no-op for ST and CE; the
+        # type-fit re-rank inside _retrieve supplies the typing continuously.
+        if getattr(config, "RETRY_TYPE_HARD_FILTER", False):
+            eligible = _typed_candidates(pool, ftype)
+            cand = _retrieve(question, eligible if len(eligible) >= k else list(pool),
+                             k, ftype)
+        else:
             cand = _retrieve(question, list(pool), k, ftype)
     if not cand:
         # [AUDIT] RANK, don't just filter -- see _type_fit_score.
@@ -662,15 +666,25 @@ def select_typed_positives(pool, ftype, seeds, k, question=None):
                     break
     out = cand[:k]
 
-    # [AUDIT D41] Swap the LAST slot for a demonstration of the cure. Last, not
-    # first, so the most relevant retrieved exemplar keeps the position the model
-    # attends to most, and the demo sits closest to the live question. One slot is
-    # replaced, never added, so typed and generic still show exactly k exemplars.
+    # [AUDIT D41] Swap ONE slot for a demonstration of the cure -- replaced, never
+    # added, so typed and generic still show exactly k exemplars.
+    #
+    # [AUDIT D47] It must displace the LEAST relevant exemplar, and which end that
+    # is depends on RETRY_RELEVANCE_LAST. D42 reversed the block so the most
+    # relevant sits nearest the question; D41 was still overwriting the last slot,
+    # so the demo was displacing the BEST-matched exemplar every time (measured:
+    # similarity 0.169, rank 1 of 8, thrown away). With the ordering reversed the
+    # least relevant is at the FRONT, so the demo goes there -- it also primes the
+    # procedure early, while the most relevant exemplar keeps the slot adjacent to
+    # the live question.
     if getattr(config, "TYPED_APPROACH_DEMO", False):
         from diagnosis import approach_demo
         demo = approach_demo(ftype)
         if demo is not None and len(out) >= 1:
-            out = out[:k - 1] + [demo]
+            if getattr(config, "RETRY_RELEVANCE_LAST", False):
+                out = [demo] + out[1:k]          # drop the least relevant (front)
+            else:
+                out = out[:k - 1] + [demo]       # least relevant is at the back
     return out
 
 
@@ -735,6 +749,15 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     """
     ftype = (FailureType(rec["diagnosis"]) if rec.get("diagnosis")
              else FailureType.UNCLASSIFIED)
+    # [AUDIT D52] Abstention is right for the taxonomy, wrong for the cure. The
+    # RECORDED diagnosis stays whatever the cascade said -- the abstain rate the
+    # paper reports is unchanged -- but an UNCLASSIFIED failure with obvious trace
+    # evidence gets the matched treatment instead of the generic one. 74 of 88
+    # UNCLASSIFIED failures route this way (66 CE, 8 AL).
+    _cure_note = ""
+    if mode in ("typed", "typed+neg"):
+        from diagnosis import cure_type_for
+        ftype, _cure_note = cure_type_for(ftype, rec.get("trace"))
     if mode in ("typed", "typed+neg"):
         positives = select_typed_positives(pool, ftype, seeds, budget,
                                            question=rec["question"])
@@ -764,6 +787,28 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
         instruction = ""
         temperature = 0.8                       # must be > 0 or greedy repeats
 
+    # [AUDIT D46] NON-GENERATIVE cure, tried FIRST. When the failed trace is
+    # self-inconsistent -- it reports a value its own arithmetic contradicts --
+    # the cure is not a better prompt, it is the corrected number. Gold-free, and
+    # it returns before any generation, so these retries cost no GPU.
+    if (mode in ("typed", "typed+neg")
+            and getattr(config, "TYPED_SYMBOLIC_REPAIR", False)
+            and ftype.value in getattr(config, "SYMBOLIC_REPAIR_TYPES", ())):
+        import symbolic_repair as _SR
+        _fixed = _SR.repair(rec.get("trace", ""),
+                            (rec.get("signals") or {}).get("final_answer"))
+        if _fixed:
+            _trace, _ans, _note = _fixed
+            _c, _l, _d, _ = score_trace(rec["question"], _trace,
+                                        rec["gold_solution"], rec["gold_answer"])
+            retry_once.last_accept = {"n_resampled": 0, "accept_ok": True,
+                                      "accept_reason": _note, "prefill": "",
+                                      "symbolic_repair": True,
+                                      "symbolic_repair_post": False,
+                                      "cure_type": ftype.value,
+                                      "cure_note": _cure_note}
+            return _trace, _c, _l, _d, 0, len(positives), False
+
     prompt, extra_system = build_retry_prompt(rec["question"], positives, instruction)
 
     # [AUDIT D43] Typed-only prefill: end the prompt mid-sentence so the model has
@@ -771,7 +816,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     prefill = ""
     if mode in ("typed", "typed+neg"):
         from diagnosis import prefill_for
-        prefill = prefill_for(ftype)
+        prefill = prefill_for(ftype, rec.get("question"))
         if prefill:
             prompt = prompt + " " + prefill
 
@@ -807,9 +852,15 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
         from diagnosis import cure_took
         accept_ok, accept_why = cure_took(ftype, rec["question"], trace, rec.get("trace"))
         if not accept_ok:
+            # [AUDIT D50] TR failed by running out of room; resampling at the same
+            # ceiling just truncates again.
+            _mnt = max_new_tokens
+            if ftype is FailureType.TR:
+                _mnt = int(max_new_tokens * float(
+                    getattr(config, "ACCEPT_TR_TOKEN_BOOST", 1.0)))
             alt, _ = gen._run_model(
                 prompt, temperature=float(getattr(config, "ACCEPT_RESAMPLE_TEMP", 0.7)),
-                max_new_tokens=max_new_tokens, num_return_sequences=1,
+                max_new_tokens=_mnt, num_return_sequences=1,
                 return_logprobs=False, extra_system=extra_system,
                 problem=rec["question"])
             alt_trace = alt[0]
@@ -821,6 +872,14 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                 alt_trace, G.extract_final_answer(alt_trace))
             n_resampled = 1
             alt_ok, _ = cure_took(ftype, rec["question"], alt_trace, rec.get("trace"))
+            # [AUDIT D45] A resample must pass the test AND not compute less than
+            # the candidate it replaces. Otherwise "no false equation" is won by
+            # stating no equations, which is what collapsed CE on the first re-run.
+            if alt_ok and getattr(config, "ACCEPT_REJECT_DEGENERATE", True):
+                from components import computational_steps as _cs
+                if _cs(alt_trace) < _cs(trace):
+                    alt_ok = False
+                    accept_why = (accept_why or "") + " | resample rejected: computed less"
             if alt_ok:                       # the resample passed; the first did not
                 trace, accept_ok, accept_why = alt_trace, True, ""
     elif mode == "generic" and getattr(config, "GENERIC_MATCH_RESAMPLE", False):
@@ -839,9 +898,36 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
             trace, _ = G.ensure_hash_line_flagged(alt[0], G.extract_final_answer(alt[0]))
             n_resampled = 1
 
+    # [AUDIT D46b] Repair the RETRY OUTPUT too, not only the failed pass-1 trace.
+    # The retry can be self-inconsistent in its own right. Measured on the 738
+    # completed retries: repairing pass-1 alone fixes 31 the generative cure
+    # missed; repairing the retry output as well fixes 44. +6.0 points instead of
+    # +4.2, for no extra generation.
+    if (mode in ("typed", "typed+neg")
+            and getattr(config, "TYPED_SYMBOLIC_REPAIR", False)
+            and ftype.value in getattr(config, "SYMBOLIC_REPAIR_TYPES", ())):
+        import symbolic_repair as _SR
+        _r = _SR.repair(trace, G.extract_final_answer(trace))
+        _post_repair = bool(_r)
+        if _r:
+            trace = _r[0]
+    else:
+        _post_repair = False
+
     comps, label, diag, _ = score_trace(rec["question"], trace,
                                         rec["gold_solution"], rec["gold_answer"])
     gen_tokens = len(gen.tokenizer.encode(trace)) if gen.tokenizer else len(trace.split())
+    # [AUDIT D45] Record what the acceptance test did. The first re-run logged
+    # nothing, so there was no way to tell from results.jsonl whether the test had
+    # fired at all -- the damage had to be inferred from equation counts.
+    # NOTE: this assignment REPLACES the dict, so every flag must be set here.
+    # An earlier version wrote symbolic_repair_post above and had it silently
+    # wiped by this line -- the repair ran but was never recorded.
+    retry_once.last_accept = {"n_resampled": n_resampled, "accept_ok": bool(accept_ok),
+                              "accept_reason": accept_why, "prefill": prefill,
+                              "symbolic_repair": False,
+                              "symbolic_repair_post": _post_repair,
+                              "cure_type": ftype.value, "cure_note": _cure_note}
     return trace, comps, label, diag, gen_tokens, len(positives), _hash_appended
 
 
@@ -1286,6 +1372,7 @@ def run_full(gen, manual, eval_problems, strategy_id, n_problems,
                 log_detail(_detail_record(
                     phase="retry", iter=it, origin=origin, id=rec["id"],
                     retry_mode=retry_mode,
+                    **(getattr(retry_once, "last_accept", None) or {}),
                     question=rec["question"], gold_answer=rec["gold_answer"],
                     prev_label=rec["label"], prev_diagnosis=prev_diag,
                     typed_positives=npos, instruction=_logged_instr,

@@ -394,6 +394,9 @@ TYPED_PREFILL_ENABLED = True         # revert: False
 # retry that fails its own type's test is resampled once and the better candidate
 # is kept. Generic has no diagnosis and therefore no test.
 TYPED_ACCEPT_TEST = True             # revert: False
+# [AUDIT D45] Never keep a resample that computes LESS than the candidate it
+# replaces. Without this the acceptance test is gamed by degenerate traces.
+ACCEPT_REJECT_DEGENERATE = True      # revert: False
 # Measured on the 1,068 retries already in hand -- correct rate when the test
 # PASSES vs when it FAILS:
 #     CE  38.3% vs  3.6%   (10.6x)      <- keep
@@ -405,10 +408,83 @@ TYPED_ACCEPT_TEST = True             # revert: False
 #     NR  11.1% vs 14.5%   ( 0.8x)      <- DROP, inverted
 # Only the types where the test actually predicts correctness are gated. Testing
 # SM and NR would burn generations resampling on noise.
+# [AUDIT D45] WP kept only because its test (the answer must equal a computed
+# value) cannot be passed by computing less -- it needs at least one equation.
 ACCEPT_TEST_TYPES = ("CE", "AL", "TR", "ST", "WP")
 ACCEPT_RESAMPLE_TEMP = 0.7           # >0, or the resample reproduces the failure
+# [AUDIT D50] TR means the model ran out of room. Resampling at the SAME ceiling
+# reproduces the truncation: on the pre-fix run TR retries truncated again 19.6%
+# of the time, the worst of any type. The cure for "ran out of room" is room.
+# Applies only to the TR resample, which is 56 problems -- a rounding error in the
+# generation budget, already accounted for in the 4% typed/generic difference.
+ACCEPT_TR_TOKEN_BOOST = 1.6          # revert: 1.0
 # Compute parity: generic resamples at the SAME RATE as typed, chosen at random,
 # keeping the second sample. Without this typed gets more generations and a
 # reviewer can attribute the win to compute. Leave True for the paper.
-GENERIC_MATCH_RESAMPLE = True        # revert: False
+# [AUDIT D48] Turned OFF by default -- the arms are already compute-matched.
+#
+# Measured on the 1,068 retries: symbolic repair returns WITHOUT generating on
+# 15.5% of them, while the acceptance test spends an extra generation on ~23% of
+# the rest. Net budget is 1.040 generations per retry for typed against 1.000 for
+# generic -- a 4% difference, well inside what a re-run of generic would cost.
+#
+# So a completed generic arm does NOT need re-running to stay a fair control.
+# Set this True only if you are running generic fresh anyway.
+GENERIC_MATCH_RESAMPLE = False       # revert: True
 GENERIC_RESAMPLE_RATE = 0.0          # set from the typed run; 0.0 = auto (measured)
+
+
+# [AUDIT D46] A NON-GENERATIVE cure, routed by the diagnosis.
+#
+# Prompting fixes STRUCTURAL failures and cannot fix COMPUTATIONAL ones. The
+# re-run showed exactly that: WP +6.0, ST +8.2, TR +6.1 over generic, but CE
+# -16.0. So CE stops being re-prompted and gets its arithmetic repaired instead.
+#
+# Fires only when the trace is SELF-INCONSISTENT -- the answer it reports is the
+# stated right-hand side of an equation that is arithmetically false. No gold is
+# needed to detect that, or to know what the model's own arithmetic implies.
+#
+# Measured on 1,068 wrong traces: fires on 183 (17.1%), of which 44 land exactly
+# on gold (+2.9 pts) for ZERO generations. On the 738-problem re-run it fixes 31
+# the generative cure MISSED, worth +4.2 pts. It also saves GPU: repair runs
+# BEFORE the retry, so ~20 of every 94 CE retries need no generation at all.
+TYPED_SYMBOLIC_REPAIR = True         # revert: False
+# Types whose diagnosis says the failure is computational. WP, ST and NR are
+# excluded: repair fired on 0 of them, because arithmetic was never the problem.
+SYMBOLIC_REPAIR_TYPES = ("CE", "SM", "AL", "TR", "UNCLASSIFIED")
+
+
+# [AUDIT D49] The hard type filter starves retrieval, and D40 already replaced it.
+#
+# select_typed_positives filtered the pool through _typed_candidates() and then
+# retrieved inside whatever survived. Measured cost in topical relevance:
+#
+#     type  eligible  share   filtered   unfiltered   relevance lost
+#     SM        94     28%     0.0533      0.0913        -42%  (unfiltered is +71%)
+#     AL       273     82%     0.0709      0.0893        -21%
+#     NR       176     53%     0.0687      0.0861        -20%
+#     WP       291     87%     0.0928      0.0963         -4%
+#     ST/CE    334    100%     same        same            0%
+#
+# SM is the second-largest failure class and the filter was taking 42% of its
+# relevance. The filter is also a no-op for ST and CE, where it passes the whole
+# pool -- so it was contributing nothing where it was harmless and doing damage
+# where it bit.
+#
+# D40's continuous type-fit re-rank supplies the typing signal already, blended
+# with relevance, over the WHOLE pool. With this False, retrieval sees everything
+# and typing comes from the blend rather than from a boolean gate.
+RETRY_TYPE_HARD_FILTER = False       # revert: True
+
+
+# [AUDIT D51] Write the question's numbers into SM's prefill instead of asking
+# for them. 70% of SM traces (177 of 253) use a value the question never gave;
+# a regex cannot hallucinate one.
+SM_INJECT_QUESTION_NUMBERS = True    # revert: False
+
+# [AUDIT D52] When the cascade abstains, still apply the best-matched cure.
+# 84% of UNCLASSIFIED failures carry a clear gold-free signature (75% a false
+# equation, 9% an unresolved relation) yet all of them got the generic cure --
+# the worst-performing group at ~8-9% recovery. The RECORDED diagnosis stays
+# UNCLASSIFIED, so the abstain rate the paper reports is unchanged.
+UNCLASSIFIED_FALLBACK_CURE = True    # revert: False
