@@ -43,11 +43,33 @@ and start hurting:
       linear                  0.603      0.616          0.608
       0.7 linear + 0.3 RF     0.604      0.608          0.601
 
-So the type head now uses hand + TRACE text only, linear only. The honest numbers
-are detect AUROC 0.753 and type accuracy 0.616 (majority 0.216, lift +0.400).
+So the type head now uses hand + TRACE text only, linear only. The table above is
+from the config search (linear head alone); the SHIPPED model reports detect AUROC
+0.756 and type accuracy 0.627 (majority 0.216, lift +0.411). Trust what fit()
+prints over this docstring.
 
 Everything reported from here uses GroupKFold. It is the only split that answers
 the question CTC will actually face: an unseen problem.
+
+ONE NUMBER HIDES TWO DISTRIBUTIONS
+----------------------------------
+A question contributes both a pass-1 trace and a retry trace, and they are not
+equally legible. Out of fold, sliced by phase:
+
+    slice    n      wrong%   detect AUROC   type acc
+    pass-1   1500   71.2%    0.776          0.598
+    retry    1068   81.5%    0.683          0.679
+    both     2568   75.5%    0.751          0.635
+
+DEPLOYMENT ONLY EVER SEES PASS-1. run_ctc_validate.py reads a first attempt and
+nothing else, so it should land near 0.776 for detection and 0.598 for type --
+above the headline on one, below it on the other. Neither is a regression, and
+comparing stage 2 against the headline instead of against the pass-1 row will
+make a working detector look broken and a broken type head look fine.
+
+Training on pass-1 rows alone was tried, since that IS the deployment
+distribution: detect +0.006 (bootstrap 95% CI [-0.004, +0.016], P(gain>0)=0.88),
+type -0.008. Not significant, and it halves the data, so the retries stay in.
 
 WHAT DID NOT WORK, AND WHY IT IS NOT HERE
 -----------------------------------------
