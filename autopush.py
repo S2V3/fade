@@ -53,15 +53,12 @@ def _rows(p):
     return sum(1 for _ in open(f)) if os.path.exists(f) else 0
 
 
-def _safe_copy(src, dst):
-    """Copy a store, dropping any partially-written trailing JSON line."""
-    shutil.rmtree(dst, ignore_errors=True)
-    shutil.copytree(src, dst)
-    f = os.path.join(dst, "results.jsonl")
-    if not os.path.exists(f):
+def _sanitise(path):
+    """Drop any partially-written JSON line. -> (kept, dropped)"""
+    if not os.path.exists(path):
         return 0, 0
     good, dropped = [], 0
-    for ln in open(f, errors="replace"):
+    for ln in open(path, errors="replace"):
         if not ln.strip():
             continue
         try:
@@ -69,9 +66,27 @@ def _safe_copy(src, dst):
             good.append(ln if ln.endswith("\n") else ln + "\n")
         except Exception:
             dropped += 1
-    with open(f, "w") as out:
+    with open(path, "w") as out:
         out.writelines(good)
     return len(good), dropped
+
+
+def _safe_copy(src, dst):
+    """Copy a store, dropping any partially-written trailing JSON line.
+
+    [AUDIT D75] every *.jsonl is sanitised, not just results.jsonl. Stage 2
+    writes retries.jsonl in a second pass, and a snapshot taken mid-append used
+    to push a torn last line. The resume path tolerates it -- that retry is
+    simply redone -- but a checkpoint should never carry known-corrupt bytes.
+    """
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+    for name in sorted(os.listdir(dst)):
+        if name.endswith(".jsonl") and name != "results.jsonl":
+            k, d = _sanitise(os.path.join(dst, name))
+            if d:
+                print(f"    [autopush] {name}: dropped {d} torn line(s)")
+    return _sanitise(os.path.join(dst, "results.jsonl"))
 
 
 class AutoPush:
