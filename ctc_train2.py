@@ -154,7 +154,7 @@ class CTC2:
         return hstack(parts).tocsr()
 
     # ----------------------------------------------------------------- fit
-    def fit(self, rows, correct, types, verbose=True):
+    def fit(self, rows, correct, types, verbose=True, phases=None):
         from sklearn.linear_model import LogisticRegression
         from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         from sklearn.model_selection import GroupKFold, cross_val_predict
@@ -179,6 +179,30 @@ class CTC2:
                "auroc_linear": float(roc_auc_score(y, pl)),
                "auroc_tree": float(roc_auc_score(y, pg)),
                "base_wrong_rate": float(y.mean())}
+
+        # [AUDIT D77] CALIBRATION FOR ONLINE USE. Stage 2 and stage 3 decide
+        # per question, the moment the trace exists -- there is no distribution
+        # to take a quantile of, because the other 399 questions have not been
+        # attempted yet. So the mapping from "retry the worst 40%" to an actual
+        # p_wrong cut has to be measured HERE, out of fold, and shipped with the
+        # model. Restricted to pass-1 rows when the phase is known, since that is
+        # the only kind of trace a deployed detector ever reads.
+        _m = (np.array([p == "pass1" for p in phases]) if phases is not None
+              else np.ones(len(y), bool))
+        if _m.sum() < 50:
+            _m = np.ones(len(y), bool)
+        bcal, ycal = blend[_m], y[_m]
+        det["calibration_slice"] = ("pass1" if phases is not None and _m.sum() < len(y)
+                                    else "all")
+        det["calibration_n"] = int(_m.sum())
+        det["budget_thresholds"] = {}
+        det["budget_precision"] = {}
+        for bud in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0):
+            kb = max(1, int(round(bud * len(bcal))))
+            t_ = float(np.sort(bcal)[::-1][kb - 1])
+            sel = bcal >= t_
+            det["budget_thresholds"][f"{bud:.1f}"] = t_
+            det["budget_precision"][f"{bud:.1f}"] = float(ycal[sel].mean())
         self.det_lin = LIN().fit(Xs, y)
         self.det_tree = GradientBoostingClassifier(random_state=0).fit(Xd, y)
 
@@ -213,6 +237,14 @@ class CTC2:
             print(f"    ENSEMBLE              AUROC {det['auroc']:.3f}")
             if det["auroc"] < 0.70:
                 print("    !! below 0.70 -- usable for RANKING, not as a hard gate.")
+            print(f"\n    calibration for ONLINE use "
+                  f"({det['calibration_slice']} traces, n={det['calibration_n']}):")
+            print(f"    {'budget':>8}{'p_wrong cut':>13}{'precision':>11}")
+            for b in ("0.1", "0.2", "0.3", "0.4", "0.5", "0.7", "1.0"):
+                print(f"    {float(b):>8.0%}{det['budget_thresholds'][b]:>13.3f}"
+                      f"{det['budget_precision'][b]:>11.1%}")
+            print("    run_ctc_validate.py reads these to turn a budget into a cut")
+            print("    it can apply to ONE question at a time.")
             print(f"\n  TYPE    n={int(m.sum())}  majority {maj:.3f}")
             print(f"    ENSEMBLE accuracy {typ['accuracy']:.3f}  lift {typ['lift']:+.3f}")
             print(f"\n    {'type':<16}{'n':>5}{'recall':>9}")
@@ -260,7 +292,8 @@ def main():
         print("  !! under 1,000 traces -- the type head will be unstable.")
 
     rows = [(e["question"], e["trace"]) for e in ex]
-    m = CTC2().fit(rows, [e["correct"] for e in ex], [e["type"] for e in ex])
+    m = CTC2().fit(rows, [e["correct"] for e in ex], [e["type"] for e in ex],
+                phases=[e.get("phase") for e in ex])
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     m.save(out / "ctc2.joblib")
     (out / "ctc2_report.json").write_text(json.dumps(m.report, indent=2))

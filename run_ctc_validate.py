@@ -5,12 +5,30 @@ THE RUN
 -------
 400 fresh TRAIN questions (offset 1500 -- the pool-building run stopped there).
 
-  gen 1     model solves the question                    -> trace, answer
+ONE QUESTION AT A TIME -- attempt, judge, cure, next:
+
+  gen 1     model solves THIS question                   -> trace, answer
   cpu       CTC reads (question, trace), GOLD-FREE:
               p_wrong        is this trace wrong?
               predicted_type which of the eight failures?
-  gen 2     if flagged wrong: load the matched cure and solve again  [--retry-flagged]
-  score     open gold and check everything
+  gen 2     if flagged: the matched cure, solved again, right now
+  score     gold is opened LAST, and changes nothing above it
+
+Then the next question. No step reads any other problem, which is what makes
+stage 3 the same code with the scoring removed.
+
+GOLD IS REQUIRED HERE, AND THAT IS NOT A CONTRADICTION
+------------------------------------------------------
+There is no way to say whether CTC was right without knowing whether the trace was
+actually wrong and what actually went wrong with it. Both labels come from gold:
+`correct` from the answer, `true_type` from the cascade's diagnosis. So this stage
+opens gold and must.
+
+The rule is about ORDER, not abstinence. Gold is read in step 4, after the cure has
+already been chosen and run, and nothing it produces is fed back. Drop step 4
+entirely (--no-score) and steps 1-3 emit byte-identical traces -- that is the
+property that makes the same script legal on test, and the assertion below the loop
+checks it rather than trusting it.
 
 This is the full pipeline rehearsed on train, where gold exists to score it. Stage 3
 is the identical pipeline on test with the scoring removed.
@@ -53,8 +71,11 @@ pass-1 row, not the headline.
 
 Note the detector's accuracy LOSES to the majority baseline while its AUROC is
 0.78. That is not a contradiction: 71% of first attempts are wrong, so "always say
-wrong" is a strong accuracy baseline, and the detector's value is in RANKING. This
-script therefore flags a BUDGET -- the worst k% by p_wrong -- and sweeps.
+wrong" is a strong accuracy baseline, and the detector's value is in RANKING. Two
+scorecards are therefore printed separately at the end: whether the JUDGE was right
+(precision, recall, AUROC, type accuracy) and whether the MODEL got more QUESTIONS
+right (pass 1 vs final, McNemar). They are different measurements and can move in
+opposite directions.
 
 HOW THE FLAG THRESHOLD IS CHOSEN
 --------------------------------
@@ -68,8 +89,14 @@ Not by a fixed 0.5. A flag pays only when precision beats damage/(recovery+damag
       65%   ~0.50      ~83%            ~+5    <- what a fixed 0.5 would have done
      100%   0.13       71.2%         -158.5
 
-The run therefore happens in TWO PASSES: solve everything, then cut at the budget
-quantile, then retry. Both passes are gold-free; only the scoring afterwards is not.
+A quantile needs the whole distribution, which a deployed system does not have --
+question 1 must be decided before question 2 is attempted. So ctc_train2.py measures
+the budget-to-cut mapping out of fold and ships it inside the model, and 40% becomes
+"p_wrong >= 0.683", a rule ONE question can be judged against.
+
+The loop is therefore: attempt one question, analyse that trace, cure it there and
+then if it is flagged, move to the next. Nothing about one problem's decision depends
+on any other problem, so stage 3 runs identically with the scoring removed.
 
 THE TYPE CONFIDENCE GATE
 ------------------------
@@ -112,7 +139,18 @@ import config
 import generation as G
 import kaggle_run as K
 from categorizer import QuestionCategorizer
-from cure_bank import cure_for, describe
+from cure_bank import describe
+
+# [AUDIT D76] the retry here must be the SAME cure the typed arm runs. If this
+# kaggle_run.py predates the apply_cure() extraction, stage 2 would silently fall
+# back to a weaker retry and report a number that does not describe the pipeline.
+if not hasattr(K, "apply_cure"):
+    raise SystemExit(
+        "  kaggle_run.py has no apply_cure() -- it is the pre-D76 version.\n"
+        "  Stage 2 would run a retry MISSING the UNCLASSIFIED reroute, the\n"
+        "  failure-mode naming, the prefill, both resamples and symbolic repair,\n"
+        "  i.e. a weaker pipeline than the one the typed result came from.\n"
+        "  Push the updated kaggle_run.py before spending GPU.")
 
 RECOVERY_PRIOR = 0.161
 DAMAGE_PRIOR = 0.765
@@ -360,21 +398,15 @@ def main():
         if done:
             print(f"  RESUME: {len(done)} already done")
 
-    def _solve(q, positives=None, instruction=""):
+    def _solve(q):
+        """Pass 1 only. The retry goes through K.apply_cure(), which owns the
+        whole typed treatment -- see [AUDIT D76] in pass B below."""
         info = cat.categorize(q)
-        if positives is None:
-            # knn_fn=knn is REQUIRED -- without it the pool is ignored entirely.
-            res = gen.generate(q, 2, manual_exemplars=seeds, pool_exemplars=pool,
-                               category_info=info, max_new_tokens=a.max_new_tokens,
-                               return_logprobs=False, knn_fn=knn)
-            return res["trace"], G.extract_final_answer(res["trace"])
-        prompt, extra = K.build_retry_prompt(q, positives, instruction)
-        traces, _ = gen._run_model(prompt, temperature=0.0,
-                                   max_new_tokens=a.max_new_tokens,
-                                   num_return_sequences=1, return_logprobs=False,
-                                   extra_system=extra, problem=q)
-        tr, _h = G.ensure_hash_line_flagged(traces[0], G.extract_final_answer(traces[0]))
-        return tr, G.extract_final_answer(tr)
+        # knn_fn=knn is REQUIRED -- without it the pool is ignored entirely.
+        res = gen.generate(q, 2, manual_exemplars=seeds, pool_exemplars=pool,
+                           category_info=info, max_new_tokens=a.max_new_tokens,
+                           return_logprobs=False, knn_fn=knn)
+        return res["trace"], G.extract_final_answer(res["trace"])
 
     # [AUDIT D66] the negative bank the typed arm uses. Built from the POOL store,
     # never from this run -- these questions are held out and must stay that way.
@@ -393,19 +425,51 @@ def main():
         except Exception as e:
             print(f"  negatives unavailable ({e}); continuing without them")
 
+    # ---- the cut, decided BEFORE the loop and applied per question --------
+    # [AUDIT D78] ONE QUESTION AT A TIME: solve it, judge it, retry it there and
+    # then, move on. The previous version ran two passes so the cut could be a
+    # quantile of the whole p_wrong distribution -- but that is not a pipeline
+    # anyone can deploy. At test time question 1 must be decided before question 2
+    # is attempted; there is no distribution yet to take a quantile of.
+    #
+    # So the budget is converted to a FIXED p_wrong cut using the calibration
+    # ctc_train2.py measured out of fold on pass-1 traces and shipped inside the
+    # model [D77]. "Retry the worst 40%" becomes "retry p_wrong >= 0.683", which
+    # is a rule a single question can be judged against.
+    _cal = (rep.get("detect", {}) or {}).get("budget_thresholds") or {}
+    if a.threshold is not None:
+        thr = float(a.threshold); how = f"fixed --threshold {thr:.3f}"
+    elif a.flag_budget and a.flag_budget > 0:
+        key = f"{a.flag_budget:.1f}"
+        if key in _cal:
+            thr = float(_cal[key])
+            _pr = ((rep.get("detect", {}) or {}).get("budget_precision") or {}).get(key)
+            how = (f"--flag-budget {a.flag_budget:.0%} -> p_wrong >= {thr:.3f} "
+                   f"(stage-1 calibration on "
+                   f"{rep['detect'].get('calibration_slice','?')} traces"
+                   + (f", precision {_pr:.1%})" if _pr else ")"))
+        else:
+            thr = 0.683
+            how = (f"--flag-budget {a.flag_budget:.0%} -> p_wrong >= {thr:.3f} "
+                   "(FALLBACK: this model shipped no calibration table -- retrain "
+                   "with the D77 ctc_train2.py to calibrate on your own data)")
+    else:
+        thr = 0.5; how = "fallback 0.50"
+    print(f"\n  FLAG RULE: {how}")
+    print("  Applied per question, the moment its trace exists. Nothing about the")
+    print("  cut depends on the other problems, so stage 3 runs identically.")
+
     # =====================================================================
-    # PASS A -- solve every problem and score the trace. NO retry yet.
+    # THE LOOP -- solve, detect, cure, next
     # =====================================================================
-    # [AUDIT D67] the flag threshold is a QUANTILE of p_wrong, so it cannot be
-    # chosen until the whole distribution exists. Retrying inside this loop, as
-    # the previous version did, forces a fixed cut decided before any data. Two
-    # passes cost the same GPU: each problem is still solved once and retried at
-    # most once.
     f = open(results_path, "a")
-    t0 = time.time(); n_seen = 0
+    t0 = time.time()
+    n_seen = n_flag = n_retried = n_gated = 0
+    rdone = {}
 
     print("\n" + "#" * 70)
-    print(f"#  PASS A · solve + detect | n={len(problems)} | no gold in the loop")
+    print(f"#  n={len(problems)} | type gate {a.type_conf_gate:.2f} | "
+          f"retry={a.retry_flagged}")
     print("#" * 70)
 
     for i, prob in enumerate(problems, 1):
@@ -413,20 +477,73 @@ def main():
         if pid in done:
             continue
         q = prob["question"]
+
+        # 1. attempt
         trace, ans = _solve(q)
 
-        pred = ctc_model.predict(q, trace)            # GOLD-FREE
-        n_seen += 1
+        # 2. analyse -- GOLD-FREE, reads only the question and this trace
+        pred = ctc_model.predict(q, trace)
+        flagged = pred["p_wrong"] >= thr
+        n_seen += 1; n_flag += flagged
 
         row = {"id": pid, "eval_index": a.eval_offset + i - 1, "question": q,
                "trace": trace, "final_answer": ans,
                "p_wrong": pred["p_wrong"], "predicted_type": pred["predicted_type"],
                "type_confidence": pred["type_confidence"],
+               "flagged": bool(flagged), "threshold": thr,
                # [AUDIT D71] CTC2.predict returns no "features" key. The old
                # row["features"] = pred["features"] raised KeyError on the first
                # problem, before a single trace was written.
                "features": pred.get("features")}
 
+        # 3. cure, here and now, before the next question is touched
+        if flagged and a.retry_flagged:
+            # [AUDIT D68] trust the type only above the gate. Below it the
+            # predicted type is near a coin flip, and a mismatched cure is worse
+            # than the generic one -- so drop the type entirely, the same
+            # abstention the cascade uses for UNCLASSIFIED.
+            gated = pred["type_confidence"] < a.type_conf_gate
+            use_type = None if gated else pred["predicted_type"]
+            n_gated += gated; n_retried += 1
+
+            # [AUDIT D76] THE SAME CURE THE TYPED ARM RUNS, not a subset of it.
+            # This used to be cure_for() + build_retry_prompt() + one greedy
+            # generation, which gave the exemplars and the instruction but
+            # silently dropped the UNCLASSIFIED reroute (D52), the failure-mode
+            # naming (D63), the prefill (D43/D51), the acceptance resample (D44),
+            # the unchanged-answer resample (D60) and symbolic repair (D46/D61).
+            # Stage 2 was measuring a WEAKER pipeline than the one that produced
+            # the 42.0% typed result, so it would have understated CTC.
+            #
+            # apply_cure() is that pipeline with only the final score_trace()
+            # removed, so it is legal on a split with no gold. The order inside
+            # is: question-aware retrieval over the pool -> type-fit re-rank ->
+            # layered ordering (most relevant first, type-matched last, nearest
+            # the question) -> approach demo -> instruction, failure-mode naming
+            # and negatives into the SYSTEM message -> prefill -> generate.
+            mode = ("generic" if gated
+                    else ("typed+neg" if (neg and a.n_neg > 0) else "typed"))
+            trace2, meta = K.apply_cure(
+                gen, q, trace, ans, use_type, pool, seeds, a.max_new_tokens,
+                mode=mode, budget=a.exemplar_budget, negatives=neg,
+                n_neg=a.n_neg, rec_id=pid)
+            row.update({
+                "retry_trace": trace2,
+                "retry_answer": G.extract_final_answer(trace2),
+                "cure_type": ("GENERIC(gated)" if gated else meta.get("cure_type")),
+                "type_gated": bool(gated), "cure_mode": mode,
+                "cure": describe(use_type) if use_type else "generic",
+                "instruction": meta.get("instruction_sent", ""),
+                "prefill": meta.get("prefill", ""),
+                "cure_note": meta.get("cure_note", ""),
+                "n_resampled": meta.get("n_resampled", 0),
+                "n_unchanged_resamples": meta.get("n_unchanged_resamples", 0),
+                "symbolic_repair": meta.get("symbolic_repair", False),
+                "symbolic_repair_post": meta.get("symbolic_repair_post", False),
+                "accept_ok": meta.get("accept_ok", True),
+                "n_exemplars": meta.get("n_exemplars", 0)})
+
+        # 4. score -- the ONLY place gold is opened, and it changes nothing above
         if not a.no_score:
             gold = prob["gold_answer"]
             comps, label, diag, _ = K.score_trace(q, trace, prob["answer"], gold)
@@ -434,116 +551,50 @@ def main():
                         "correct": bool(comps.correct),
                         "true_type": (diag.ftype.value if diag else None),
                         "label": label.value, "signals": comps.signals()})
+            if "retry_trace" in row:
+                c2, _l2, _d2, _ = K.score_trace(q, row["retry_trace"],
+                                                prob["answer"], gold)
+                row["retry_correct"] = bool(c2.correct)
+            row["final_correct"] = bool(comps.correct or row.get("retry_correct"))
 
         f.write(json.dumps(row) + "\n"); f.flush()
+        if "retry_trace" in row:
+            rdone[pid] = row
 
         if a.show_every and (i % a.show_every == 0 or i == len(problems)):
             el = time.time() - t0
-            print(f"  [{i}/{len(problems)}] {el/max(n_seen,1):.1f}s/prob", flush=True)
+            print(f"  [{i}/{len(problems)}] flagged {n_flag}/{n_seen} "
+                  f"({n_flag/max(n_seen,1):.0%}) | retried {n_retried} | "
+                  f"gated {n_gated} | {el/max(n_seen,1):.1f}s/prob", flush=True)
     f.close()
 
     rows = [json.loads(l) for l in open(results_path) if l.strip()]
     rows.sort(key=lambda r: r["id"])
+    for r in rows:                      # resumed rows are already complete
+        if "retry_trace" in r:
+            rdone.setdefault(r["id"], r)
+    n_flag = sum(bool(r.get("flagged")) for r in rows)
+    print(f"\n  flagged {n_flag}/{len(rows)} = {n_flag/max(len(rows),1):.1%}"
+          f"   retried {len(rdone)}")
 
-    # ---- choose the cut, GOLD-FREE ---------------------------------------
-    # [AUDIT D74] select by RANK, not by comparing against the quantile. p_wrong
-    # can tie -- two traces that are near-copies score identically -- and `>= thr`
-    # then flags every member of the tied group, blowing straight past the budget.
-    # A dry run with only two distinct trace strings turned a 40% budget into
-    # 100% of the set, which is the single most expensive way to be wrong here:
-    # it retries everything, and at 71% precision that LOSES problems.
-    ps = sorted((r["p_wrong"] for r in rows), reverse=True)
-    order = sorted(range(len(rows)),
-                   key=lambda i: (-rows[i]["p_wrong"], rows[i]["id"]))
-    if a.threshold is not None:
-        thr = float(a.threshold)
-        keep = {i for i in order if rows[i]["p_wrong"] >= thr}
-        how = f"fixed --threshold {thr:.2f}"
-    elif a.flag_budget and a.flag_budget > 0:
-        kbud = max(1, min(len(order), int(round(a.flag_budget * len(order)))))
-        keep = set(order[:kbud])
-        thr = rows[order[kbud - 1]]["p_wrong"]
-        how = f"--flag-budget {a.flag_budget:.0%} -> top {kbud} by p_wrong (cut {thr:.3f})"
-    else:
-        thr = 0.5
-        keep = {i for i in order if rows[i]["p_wrong"] >= thr}
-        how = "fallback 0.50"
-    for i, r in enumerate(rows):
-        r["flagged"] = i in keep
-    n_flag = sum(r["flagged"] for r in rows)
-    n_tied = sum(1 for i in order if rows[i]["p_wrong"] == thr)
-    if n_tied > 1:
-        print(f"  note: {n_tied} traces tie at the cut ({thr:.3f}); rank order "
-              "broke the tie so the budget is exact")
-    print(f"\n  FLAG RULE: {how}")
-    print(f"  flagged {n_flag}/{len(rows)} = {n_flag/max(len(rows),1):.1%}"
-          "   (nothing above read gold)")
-
-    # =====================================================================
-    # PASS B -- retry the flagged ones with a cure
-    # =====================================================================
-    retry_path = root / "retries.jsonl"
-    rdone = {}
-    if retry_path.exists():
-        for ln in open(retry_path):
-            try:
-                rr_ = json.loads(ln); rdone[rr_["id"]] = rr_
-            except Exception:
-                pass
-        if rdone:
-            print(f"  RESUME: {len(rdone)} retries already done")
-
-    if a.retry_flagged:
-        todo = [r for r in rows if r["flagged"] and r["id"] not in rdone]
-        print("\n" + "#" * 70)
-        print(f"#  PASS B · retry {len(todo)} flagged (of {n_flag}) | "
-              f"type gate {a.type_conf_gate:.2f}")
-        print("#" * 70)
-        rf = open(retry_path, "a")
-        t1 = time.time(); n_gated = 0
-        by_id = {p_["question"]: p_ for p_ in problems}
-        for j, r in enumerate(todo, 1):
-            q = r["question"]
-            # [AUDIT D68] trust the type only above the gate. Below it the
-            # predicted type is near a coin flip, and a mismatched cure is worse
-            # than the generic one -- so hand cure_for None, which is exactly the
-            # abstention path the cascade uses for UNCLASSIFIED.
-            gated = r["type_confidence"] < a.type_conf_gate
-            use_type = None if gated else r["predicted_type"]
-            n_gated += gated
-            # [AUDIT D39/D72] question= is REQUIRED. Without it every problem of a
-            # predicted type receives the IDENTICAL exemplars -- the exact defect
-            # D39 found in the retry path, silently reintroduced here.
-            positives, instruction = cure_for(use_type, pool, seeds,
-                                              a.exemplar_budget, question=q,
-                                              negatives=neg, n_neg=a.n_neg)
-            trace2, ans2 = _solve(q, positives, instruction)
-            out = {"id": r["id"], "retry_trace": trace2, "retry_answer": ans2,
-                   "cure_type": use_type or "GENERIC(gated)",
-                   "type_gated": bool(gated),
-                   "cure": describe(use_type) if use_type else "generic",
-                   "instruction": instruction,
-                   "n_exemplars": len(positives)}
-            if not a.no_score:
-                prob = by_id.get(q)
-                if prob is not None:
-                    c2, _l2, _d2, _ = K.score_trace(q, trace2, prob["answer"],
-                                                    prob["gold_answer"])
-                    out["retry_correct"] = bool(c2.correct)
-            rf.write(json.dumps(out) + "\n"); rf.flush()
-            rdone[r["id"]] = out
-            if a.show_every and (j % a.show_every == 0 or j == len(todo)):
-                print(f"  [{j}/{len(todo)}] gated to generic {n_gated} | "
-                      f"{(time.time()-t1)/j:.1f}s/retry", flush=True)
-        rf.close()
-        print(f"  type gate sent {n_gated}/{max(len(todo),1)} "
-              f"({n_gated/max(len(todo),1):.0%}) to the generic cure")
-
-    # ---- merge the two passes -------------------------------------------
-    for r in rows:
-        r.update(rdone.get(r["id"], {}))
-        if "correct" in r:
-            r["final_correct"] = bool(r["correct"] or r.get("retry_correct"))
+    # ---- the gold-free property, checked rather than asserted in prose ----
+    # Every flag must be reproducible from p_wrong and the threshold ALONE. If any
+    # row's decision disagrees with that pure function, something gold-derived
+    # reached the decision, and the same script would NOT be legal on test.
+    _bad = [r["id"] for r in rows
+            if bool(r.get("flagged")) != bool(r["p_wrong"] >= r.get("threshold", thr))]
+    if _bad:
+        raise SystemExit(
+            f"  GOLD-FREE VIOLATION: {len(_bad)} rows have a flag that is not a\n"
+            f"  function of p_wrong and the threshold (e.g. {_bad[:3]}). The retry\n"
+            "  decision depended on something else -- do not report this run.")
+    _leak = [r["id"] for r in rows
+             if any(k in (r.get("features") or {}) for k in
+                    ("gold_answer", "gold_solution", "correct", "true_type"))]
+    if _leak:
+        raise SystemExit(f"  GOLD LEAK in CTC features on {len(_leak)} rows")
+    print(f"  gold-free check: all {len(rows)} flags reproduce from p_wrong >= "
+          f"{thr:.3f}, no gold in features")
 
     summary = {"arm": "ctc_validate", "n": len(rows), "threshold": thr,
                "flag_rule": how, "flag_budget": a.flag_budget,
@@ -553,11 +604,48 @@ def main():
                "retry_flagged": a.retry_flagged, "retrieval": a.retrieval,
                "pool_size": len(pool), "exemplars_from_pool_probe": _from_pool}
 
-    # One merged file for downstream tools. results.jsonl stays pass-A-only so a
-    # resume never has to reconcile a partially-rewritten record.
+    # One merged file for downstream tools -- identical to results.jsonl now that
+    # each row is written complete, kept so existing readers do not break.
     with open(root / "merged.jsonl", "w") as mf:
         for r in rows:
             mf.write(json.dumps(r) + "\n")
+
+    # ---- did the typed machinery actually fire? --------------------------
+    # Each of these was silently absent from stage 2 before D76. Printing the
+    # counts is how you tell that the retry here IS the typed arm, rather than
+    # trusting that it is.
+    _all_r = list(rdone.values())
+    if _all_r:
+        _typed_r = [x for x in _all_r if not x.get("type_gated")]
+        print("\n  CURE MACHINERY (typed retries only, n=%d)" % len(_typed_r))
+        for lbl, key in (("prefill used", "prefill"),
+                         ("failure mode named", "instruction"),
+                         ("UNCLASSIFIED rerouted", "cure_note")):
+            n_ = sum(1 for x in _typed_r if x.get(key))
+            print(f"    {lbl:<24}{n_:>5}/{len(_typed_r)}")
+        for lbl, key in (("acceptance resample", "n_resampled"),
+                         ("unchanged-answer resample", "n_unchanged_resamples")):
+            n_ = sum(1 for x in _typed_r if x.get(key))
+            print(f"    {lbl:<24}{n_:>5}/{len(_typed_r)}")
+        for lbl, key in (("symbolic repair (pass 1)", "symbolic_repair"),
+                         ("symbolic repair (retry)", "symbolic_repair_post")):
+            n_ = sum(1 for x in _all_r if x.get(key))
+            print(f"    {lbl:<24}{n_:>5}/{len(_all_r)}")
+        # Only warn when a prefill was EXPECTED. TR, ST, CE and UNCLASSIFIED carry
+        # none by design, so "0 prefills" is correct for a run whose cures were all
+        # of those -- a dry run that predicted ST for every problem tripped an
+        # earlier version of this warning and sent me hunting a bug in working code.
+        try:
+            from diagnosis import TYPED_PREFILL
+            _has_pf = {k.value for k, v in TYPED_PREFILL.items() if v}
+        except Exception:
+            _has_pf = set()
+        _expect_pf = [x for x in _typed_r if x.get("cure_type") in _has_pf]
+        if _typed_r and not _expect_pf:
+            print("    (no prefill expected -- every cure type here carries none)")
+        elif _expect_pf and not any(x.get("prefill") for x in _expect_pf):
+            print(f"    !! {len(_expect_pf)} retries had a type that DOES carry a "
+                  "prefill and none fired -- check TYPED_PREFILL_ENABLED")
 
     if a.no_score:
         (root / config.SUMMARY_FILE).write_text(json.dumps(summary, indent=2))
@@ -782,6 +870,80 @@ def main():
                         "broken": broken,
                         "measured_damage": broken/max(len(fp_ret), 1),
                         "measured_recovery": recovered/max(len(tp_ret), 1)})
+
+    # =====================================================================
+    # TWO SCORECARDS -- they answer different questions, keep them apart
+    # =====================================================================
+    # [AUDIT D79] "accuracy" was ambiguous in every earlier report. CTC being
+    # right about a trace and the MODEL being right about a question are separate
+    # measurements, and they can move in opposite directions: a detector that
+    # flags perfectly still gains nothing if the cure cannot fix what it found,
+    # and a cure that works is wasted on traces the detector never flags.
+    print("\n" + "=" * 74)
+    print("  SCORECARD 1 · CTC -- was the JUDGE right?")
+    print("=" * 74)
+    _tp = sum(1 for r in scored if r.get("flagged") and not r["correct"])
+    _fp = sum(1 for r in scored if r.get("flagged") and r["correct"])
+    _fn = sum(1 for r in scored if not r.get("flagged") and not r["correct"])
+    _tn = sum(1 for r in scored if not r.get("flagged") and r["correct"])
+    _det_acc = (_tp + _tn) / max(len(scored), 1)
+    _maj = max(sum(y), len(scored) - sum(y)) / max(len(scored), 1)
+    print(f"  DOES AN ERROR EXIST?      at the cut actually used ({thr:.3f})")
+    print(f"    TP {_tp:>4}   FP {_fp:>4}   FN {_fn:>4}   TN {_tn:>4}")
+    print(f"    precision {_tp/max(_tp+_fp,1):>6.1%}   "
+          f"recall {_tp/max(_tp+_fn,1):>6.1%}   "
+          f"accuracy {_det_acc:>6.1%}  (majority {_maj:.1%})")
+    print(f"    AUROC {auroc:.3f}  -- the threshold-free number, and the one to")
+    print(f"    quote: accuracy loses to majority whenever most traces are wrong.")
+    print("\n  WHICH ERROR IS IT?        among wrong traces with a diagnosis")
+    if tw:
+        _tc = Counter(r["true_type"] for r in tw)
+        _typ_maj = _tc.most_common(1)[0][1] / len(tw)
+        print(f"    over ALL wrong traces        {hit}/{len(tw)} = "
+              f"{hit/len(tw):>6.1%}   (majority {_typ_maj:.1%})")
+        summary["ctc_type_majority"] = _typ_maj
+    else:
+        print("    (no wrong trace carried a cascade diagnosis)")
+    if fw:
+        print(f"    over the ones CTC FLAGGED    {h2}/{len(fw)} = {h2/len(fw):>6.1%}"
+              "   <- the only ones a cure was chosen for")
+    _ung = [r for r in scored if r.get("retry_trace") and not r.get("type_gated")
+            and r.get("true_type")]
+    if _ung:
+        _uh = sum(1 for r in _ung if r["predicted_type"] == r["true_type"])
+        print(f"    over the ones it ACTED on    {_uh}/{len(_ung)} = "
+              f"{_uh/len(_ung):>6.1%}   <- past the confidence gate")
+    summary.update({"ctc_detect_precision": _tp/max(_tp+_fp,1),
+                    "ctc_detect_recall": _tp/max(_tp+_fn,1),
+                    "ctc_detect_accuracy": _det_acc,
+                    "ctc_detect_majority": _maj})
+
+    print("\n" + "=" * 74)
+    print("  SCORECARD 2 · THE MODEL -- did it get more QUESTIONS right?")
+    print("=" * 74)
+    _p1 = sum(1 for r in scored if r["correct"])
+    _fin = sum(1 for r in scored if r.get("final_correct"))
+    print(f"  pass 1   {_p1:>4}/{len(scored)} = {_p1/max(len(scored),1):>6.1%}")
+    print(f"  final    {_fin:>4}/{len(scored)} = {_fin/max(len(scored),1):>6.1%}"
+          f"   ({(_fin-_p1)/max(len(scored),1):+.1%}, {_fin-_p1:+d} problems)")
+    _b = sum(1 for r in scored if not r["correct"] and r.get("final_correct"))
+    _c = sum(1 for r in scored if r["correct"] and not r.get("final_correct"))
+    print(f"  recovered {_b}   broken {_c}   net {_b - _c:+d}")
+    try:
+        # PAIRED -- same questions before and after, so McNemar, never a
+        # two-proportion z-test. See stats.mcnemar's docstring.
+        from stats import mcnemar
+        _mc = mcnemar({r["id"]: bool(r["correct"]) for r in scored},
+                      {r["id"]: bool(r.get("final_correct")) for r in scored})
+        print(f"  McNemar exact p = {_mc['p']:.4f}"
+              + ("   SIGNIFICANT" if _mc["p"] < 0.05 else "   not significant"))
+        summary["mcnemar_p"] = _mc["p"]
+    except Exception as _e:
+        print(f"  (McNemar unavailable: {_e})")
+    summary.update({"recovered": _b, "broken": _c})
+    print("\n  These two scorecards are independent. A perfect judge still gains")
+    print("  nothing if the cure cannot fix what it found, and a cure that works")
+    print("  is wasted on traces the judge never flags. Report both.")
 
     (root / config.SUMMARY_FILE).write_text(json.dumps(summary, indent=2))
     print("\n" + "=" * 74)

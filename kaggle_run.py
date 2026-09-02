@@ -769,8 +769,9 @@ def build_retry_prompt(problem, positives, instruction):
     return prompt, (instruction or "")
 
 
-def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
-               negatives=None, n_neg=0):
+def apply_cure(gen, question, prev_trace, prev_answer, diagnosis, pool, seeds,
+               max_new_tokens, mode="typed", budget=8, negatives=None, n_neg=0,
+               rec_id=""):
     """One hint-free retry. `mode` selects the arm:
         typed     -- typed positives (by diagnosis) + typed instruction  [FADE]
         typed+neg -- typed, PLUS a failure-mode warning in the system msg [FADE+]
@@ -788,7 +789,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     The warning goes into `instruction`, which build_retry_prompt routes to the
     system message. It never enters the exemplar block. See negatives.py.
     """
-    ftype = (FailureType(rec["diagnosis"]) if rec.get("diagnosis")
+    ftype = (FailureType(diagnosis) if diagnosis
              else FailureType.UNCLASSIFIED)
     # [AUDIT D52] Abstention is right for the taxonomy, wrong for the cure. The
     # RECORDED diagnosis stays whatever the cascade said -- the abstain rate the
@@ -798,10 +799,10 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     _cure_note = ""
     if mode in ("typed", "typed+neg"):
         from diagnosis import cure_type_for
-        ftype, _cure_note = cure_type_for(ftype, rec.get("trace"))
+        ftype, _cure_note = cure_type_for(ftype, prev_trace)
     if mode in ("typed", "typed+neg"):
         positives = select_typed_positives(pool, ftype, seeds, budget,
-                                           question=rec["question"])
+                                           question=question)
         instruction = TYPED_INSTRUCTION.get(ftype, "")
         temperature = 0.0
         # [AUDIT D63] Name the failure mode in the SYSTEM message -- the one place
@@ -815,7 +816,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                     "The last examples above show the right approach for that.\n\n"
                     + instruction)
         if mode == "typed+neg" and negatives is not None and n_neg > 0:
-            w = negatives.warning_for(rec["question"], ftype.value, k=n_neg)
+            w = negatives.warning_for(question, ftype.value, k=n_neg)
             if w:
                 instruction = (instruction + "\n\n" + w) if instruction else w
     elif mode == "generic":
@@ -823,7 +824,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
         # type-fit re-rank, no instruction, no failure-mode warning. Anything
         # typed leaking in here makes the ablation meaningless.
         positives = select_generic_positives(pool, seeds, budget,
-                                             question=rec["question"])
+                                             question=question)
         instruction = ""
         temperature = 0.0
         assert not instruction, "generic arm must carry no instruction"
@@ -855,31 +856,26 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
             and getattr(config, "TYPED_SYMBOLIC_REPAIR", False)
             and ftype.value in getattr(config, "SYMBOLIC_REPAIR_TYPES", ())):
         import symbolic_repair as _SR
-        _fixed = _SR.repair(rec.get("trace", ""),
-                            (rec.get("signals") or {}).get("final_answer"))
+        _fixed = _SR.repair((prev_trace or ""),
+                            prev_answer)
         if _fixed and not getattr(config, "SYMBOLIC_REPAIR_AS_FALLBACK", True):
             _trace, _ans, _note = _fixed        # legacy pre-emption, for the ablation
-            _c, _l, _d, _ = score_trace(rec["question"], _trace,
-                                        rec["gold_solution"], rec["gold_answer"])
-            retry_once.last_accept = {"n_resampled": 0, "accept_ok": True,
-                                      "accept_reason": _note, "prefill": "",
-                                      "symbolic_repair": True,
-                                      "symbolic_repair_post": False,
-                                      "cure_type": ftype.value,
-                                      "cure_note": _cure_note,
-                                      "n_unchanged_resamples": 0,
-                                      "instruction_sent": ""}
-            return _trace, _c, _l, _d, 0, len(positives), False
+            return _trace, {"n_resampled": 0, "accept_ok": True,
+                            "accept_reason": _note, "prefill": "",
+                            "symbolic_repair": True, "symbolic_repair_post": False,
+                            "cure_type": ftype.value, "cure_note": _cure_note,
+                            "n_unchanged_resamples": 0, "instruction_sent": "",
+                            "n_exemplars": len(positives), "hash_appended": False}
         _repaired_pass1 = _fixed[0] if _fixed else None
 
-    prompt, extra_system = build_retry_prompt(rec["question"], positives, instruction)
+    prompt, extra_system = build_retry_prompt(question, positives, instruction)
 
     # [AUDIT D43] Typed-only prefill: end the prompt mid-sentence so the model has
     # to complete it. Generic and immediate get "" and are byte-identical to before.
     prefill = ""
     if mode in ("typed", "typed+neg"):
         from diagnosis import prefill_for
-        prefill = prefill_for(ftype, rec.get("question"))
+        prefill = prefill_for(ftype, question)
         if prefill:
             prompt = prompt + " " + prefill
 
@@ -887,7 +883,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                                max_new_tokens=max_new_tokens,
                                num_return_sequences=1, return_logprobs=False,
                                extra_system=extra_system,
-                               problem=rec["question"])   # [AUDIT D2] integrity
+                               problem=question)   # [AUDIT D2] integrity
     trace = traces[0]
     if prefill:
         # Stitch the prefill back on, or every downstream signal (n_steps, the
@@ -913,7 +909,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     accept_ok, accept_why = True, ""
     if mode in ("typed", "typed+neg"):
         from diagnosis import cure_took
-        accept_ok, accept_why = cure_took(ftype, rec["question"], trace, rec.get("trace"))
+        accept_ok, accept_why = cure_took(ftype, question, trace, prev_trace)
         if not accept_ok:
             # [AUDIT D50] TR failed by running out of room; resampling at the same
             # ceiling just truncates again.
@@ -925,7 +921,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                 prompt, temperature=float(getattr(config, "ACCEPT_RESAMPLE_TEMP", 0.7)),
                 max_new_tokens=_mnt, num_return_sequences=1,
                 return_logprobs=False, extra_system=extra_system,
-                problem=rec["question"])
+                problem=question)
             alt_trace = alt[0]
             if prefill:
                 _h = prefill.strip()
@@ -934,7 +930,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
             alt_trace, _ = G.ensure_hash_line_flagged(
                 alt_trace, G.extract_final_answer(alt_trace))
             n_resampled = 1
-            alt_ok, _ = cure_took(ftype, rec["question"], alt_trace, rec.get("trace"))
+            alt_ok, _ = cure_took(ftype, question, alt_trace, prev_trace)
             # [AUDIT D45] A resample must pass the test AND not compute less than
             # the candidate it replaces. Otherwise "no false equation" is won by
             # stating no equations, which is what collapsed CE on the first re-run.
@@ -952,12 +948,12 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
         # to the diagnosis.
         import random as _rnd
         rate = float(getattr(config, "GENERIC_RESAMPLE_RATE", 0.0))
-        if rate > 0 and _rnd.Random(hash(rec["id"]) & 0xFFFFFFFF).random() < rate:
+        if rate > 0 and _rnd.Random(hash(rec_id) & 0xFFFFFFFF).random() < rate:
             alt, _ = gen._run_model(
                 prompt, temperature=float(getattr(config, "ACCEPT_RESAMPLE_TEMP", 0.7)),
                 max_new_tokens=max_new_tokens, num_return_sequences=1,
                 return_logprobs=False, extra_system=extra_system,
-                problem=rec["question"])
+                problem=question)
             trace, _ = G.ensure_hash_line_flagged(alt[0], G.extract_final_answer(alt[0]))
             n_resampled = 1
 
@@ -968,7 +964,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
     n_unchanged = 0
     if (mode in ("typed", "typed+neg")
             and getattr(config, "RETRY_RESAMPLE_IF_UNCHANGED", False)):
-        prev_ans = (rec.get("signals") or {}).get("final_answer")
+        prev_ans = prev_answer
         for _ in range(int(getattr(config, "UNCHANGED_MAX_RESAMPLES", 1))):
             cur = G.extract_final_answer(trace)
             if prev_ans is None or cur is None:
@@ -984,7 +980,7 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
                 temperature=float(getattr(config, "UNCHANGED_RESAMPLE_TEMP", 0.8)),
                 max_new_tokens=max_new_tokens, num_return_sequences=1,
                 return_logprobs=False, extra_system=extra_system,
-                problem=rec["question"])
+                problem=question)
             alt_trace = alt[0]
             if prefill:
                 _h = prefill.strip()
@@ -1022,25 +1018,54 @@ def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
             trace = _repaired_pass1
             _used_repaired = True
 
-    comps, label, diag, _ = score_trace(rec["question"], trace,
-                                        rec["gold_solution"], rec["gold_answer"])
-    gen_tokens = len(gen.tokenizer.encode(trace)) if gen.tokenizer else len(trace.split())
+    
     # [AUDIT D45] Record what the acceptance test did. The first re-run logged
     # nothing, so there was no way to tell from results.jsonl whether the test had
     # fired at all -- the damage had to be inferred from equation counts.
-    # NOTE: this assignment REPLACES the dict, so every flag must be set here.
-    # An earlier version wrote symbolic_repair_post above and had it silently
-    # wiped by this line -- the repair ran but was never recorded.
-    retry_once.last_accept = {"n_resampled": n_resampled, "accept_ok": bool(accept_ok),
-                              "accept_reason": accept_why, "prefill": prefill,
-                              "symbolic_repair": _used_repaired,
-                              "symbolic_repair_post": _post_repair,
-                              "cure_type": ftype.value, "cure_note": _cure_note,
-                              "n_unchanged_resamples": n_unchanged,
-                              # [AUDIT D54] the instruction ACTUALLY SENT, including
-                              # the failure-mode warning appended in typed+neg.
-                              "instruction_sent": instruction}
-    return trace, comps, label, diag, gen_tokens, len(positives), _hash_appended
+    # NOTE: this dict is the WHOLE record of what the cure did, so every flag
+    # must be set here. An earlier version wrote symbolic_repair_post above and
+    # had it silently wiped by a later assignment -- the repair ran but was never
+    # recorded.
+    return trace, {"n_resampled": n_resampled, "accept_ok": bool(accept_ok),
+                   "accept_reason": accept_why, "prefill": prefill,
+                   "symbolic_repair": _used_repaired,
+                   "symbolic_repair_post": _post_repair,
+                   "cure_type": ftype.value, "cure_note": _cure_note,
+                   "n_unchanged_resamples": n_unchanged,
+                   # [AUDIT D54] the instruction ACTUALLY SENT, including the
+                   # failure-mode warning appended in typed+neg.
+                   "instruction_sent": instruction,
+                   "n_exemplars": len(positives),
+                   "hash_appended": bool(_hash_appended)}
+
+
+def retry_once(gen, rec, pool, seeds, max_new_tokens, mode="typed", budget=8,
+               negatives=None, n_neg=0):
+    """Scored wrapper over apply_cure() -- the TRAIN path, where gold exists.
+
+    [AUDIT D76] The cure used to live in this function, which meant the only way
+    to run it was to hand over a record carrying gold_solution and gold_answer.
+    Stage 2 and stage 3 have neither, so run_ctc_validate.py had reimplemented a
+    SUBSET of it: exemplars and an instruction, but no UNCLASSIFIED reroute, no
+    failure-mode naming, no prefill, no acceptance resample, no unchanged-answer
+    resample and no symbolic repair. It was measuring a weaker pipeline than the
+    one the 42.0% typed result came from, and would have understated CTC.
+
+    Everything except the final score_trace is gold-free, so the cure now lives
+    in apply_cure() and BOTH paths call it. This function adds only scoring.
+    """
+    trace, meta = apply_cure(
+        gen, rec["question"], rec.get("trace"),
+        (rec.get("signals") or {}).get("final_answer"),
+        rec.get("diagnosis"), pool, seeds, max_new_tokens, mode=mode,
+        budget=budget, negatives=negatives, n_neg=n_neg, rec_id=rec.get("id", ""))
+    comps, label, diag, _ = score_trace(rec["question"], trace,
+                                        rec["gold_solution"], rec["gold_answer"])
+    gen_tokens = (len(gen.tokenizer.encode(trace)) if gen.tokenizer
+                  else len(trace.split()))
+    retry_once.last_accept = meta
+    return (trace, comps, label, diag, gen_tokens, meta["n_exemplars"],
+            meta["hash_appended"])
 
 
 def _detail_record(**kw):
