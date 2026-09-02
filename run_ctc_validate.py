@@ -171,6 +171,13 @@ def main():
     ap.add_argument("--store-dir", required=True)
     ap.add_argument("--n-problems", type=int, default=400)
     ap.add_argument("--eval-offset", type=int, default=1500)
+    # [AUDIT D81] STAGE 3. --split test draws the QUESTIONS from the test split
+    # while the SEEDS and the POOL stay exactly as the train run built them --
+    # they are the model's own successes and are part of the system, not part of
+    # the evaluation. Only the questions must be unseen.
+    ap.add_argument("--split", choices=["train", "test"], default="train",
+                    help="where the QUESTIONS come from (default train). "
+                         "Seeds and pool always come from the train run.")
     ap.add_argument("--model", default="meta-llama/Llama-2-7b-chat-hf")
     ap.add_argument("--seed-pool", type=int, default=2000)
     ap.add_argument("--retrieval", choices=["knn", "3stage"], default="3stage",
@@ -226,7 +233,12 @@ def main():
     a = ap.parse_args()
 
     K.MODEL_ID = a.model
-    K.SPLIT_TAG = "train"
+    K.SPLIT_TAG = a.split
+    if a.split == "test" and not a.no_score:
+        print("\n  NOTE: --split test WITH scoring. Legal -- gold is opened only")
+        print("  after every decision -- but stage 3 is normally --no-score, and")
+        print("  the two must agree. Run --no-score first, then this, and diff the")
+        print("  traces: they must be identical or the gold rule was broken.")
     G.set_exemplar_budget(a.exemplar_budget)
     K.version_banner()
     token = K.resolve_hf_token(a.secret_name)
@@ -293,16 +305,34 @@ def main():
     # file deleted that cache when the eval list was too short, which forced a
     # fresh selection -- exactly what we do not want.)
     need = a.eval_offset + a.n_problems
+    # Seeds ALWAYS come from train, on both splits. They were chosen once by the
+    # train run and are part of the frozen system; re-selecting them on test
+    # would be fitting the prompt to the evaluation.
     train = K._load_split("train", a.seed_pool)
     manual, eval_problems = K.build_seeds_and_eval_order(train, a.seed_pool)
     seeds = manual.get(2, [])
     seed_qs = {ex.get("question") for v in manual.values() for ex in v}
     n_cached = len(eval_problems)
 
+    if a.split == "test":
+        # [AUDIT D81] The QUESTIONS are the test split, in dataset order. No seed
+        # selection, no reordering, no exclusion -- there is nothing to exclude,
+        # since no test question ever entered the pool or the seeds.
+        eval_problems = K._load_split("test", None)
+        n_cached = len(eval_problems)
+        print(f"\n  TEST SPLIT: {len(eval_problems)} questions, dataset order")
+        _sq = {p_["question"] for p_ in eval_problems} & seed_qs
+        if _sq:
+            raise SystemExit(f"  {len(_sq)} SEED questions appear in test -- stop")
+        if a.n_problems > len(eval_problems) - a.eval_offset:
+            a.n_problems = len(eval_problems) - a.eval_offset
+            need = a.eval_offset + a.n_problems
+            print(f"  n-problems clipped to {a.n_problems} (the split's size)")
+
     # Seed selection removes the chosen problems from the eval list (2000 - 268 =
     # 1732), so [1500:1900] would silently return 232, not 400. EXTEND the tail
     # with train problems beyond the seed pool -- an append, never a re-selection.
-    if n_cached < need:
+    if n_cached < need and a.split == "train":
         extra = K._load_split("train", a.seed_pool + (need - n_cached) + 800)
         have = {p_["question"] for p_ in eval_problems} | seed_qs
         for p_ in extra[a.seed_pool:]:
@@ -340,6 +370,8 @@ def main():
                 continue
             if r.get("phase") == "pass1" and r.get("question"):
                 seen.add(r["question"])
+    # On test this is a formality -- the pool was built from train -- but a
+    # formality that costs nothing and would catch a mis-set --split.
     overlap = sum(1 for p_ in problems if p_["question"] in seen)
     print(f"  overlap with the {len(seen)} questions the train run already saw: {overlap}")
     if overlap:
@@ -381,7 +413,8 @@ def main():
     root = Path(a.store_dir); root.mkdir(parents=True, exist_ok=True)
     snap = {k: getattr(config, k) for k in dir(config)
             if k.isupper() and isinstance(getattr(config, k), (int, float, str, bool))}
-    snap["FADE_ARM"] = "ctc_validate"
+    snap["FADE_ARM"] = "ctc_validate" if a.split == "train" else "ctc_test"
+    snap["FADE_SPLIT"] = a.split
     snap["FADE_CTC_FLAG_BUDGET"] = a.flag_budget
     snap["FADE_CTC_THRESHOLD"] = -1.0 if a.threshold is None else a.threshold
     snap["FADE_CTC_TYPE_GATE"] = a.type_conf_gate
@@ -561,11 +594,33 @@ def main():
         if "retry_trace" in row:
             rdone[pid] = row
 
+        # [AUDIT D80] The first few questions print one line each, so the
+        # interleaving is visible in the log rather than taken on trust: every
+        # question is solved, judged and cured before the next is touched. If you
+        # ever see two SOLVE lines with no decision between them, something is
+        # batching and this loop is not doing what it claims.
+        if n_seen <= 3:
+            _d = ("flagged -> cured" if row.get("retry_trace")
+                  else ("flagged, retry off" if row.get("flagged") else "clean, moving on"))
+            print(f"    {pid}  p_wrong {pred['p_wrong']:.3f}  "
+                  f"{pred['predicted_type']:<13} conf {pred['type_confidence']:.2f}"
+                  f"  -> {_d}", flush=True)
+            if n_seen == 3:
+                print("    (per-question lines stop here; totals every "
+                      f"{a.show_every or '--'} below)")
+
         if a.show_every and (i % a.show_every == 0 or i == len(problems)):
             el = time.time() - t0
-            print(f"  [{i}/{len(problems)}] flagged {n_flag}/{n_seen} "
-                  f"({n_flag/max(n_seen,1):.0%}) | retried {n_retried} | "
-                  f"gated {n_gated} | {el/max(n_seen,1):.1f}s/prob", flush=True)
+            # `i` walks the whole list; `n_seen` counts only what THIS session
+            # generated. On a resume they differ, and an earlier version printed
+            # them side by side with no labels -- "[60/120] flagged 13/13" reads
+            # like a bug when it is simply 47 problems restored from a checkpoint.
+            _resumed = i - n_seen
+            print(f"  [{i}/{len(problems)}]"
+                  + (f" ({_resumed} resumed + {n_seen} new)" if _resumed else "")
+                  + f" | flagged {n_flag}/{n_seen} ({n_flag/max(n_seen,1):.0%} of new)"
+                  f" | retried {n_retried} | gated {n_gated}"
+                  f" | {el/max(n_seen,1):.1f}s/prob", flush=True)
     f.close()
 
     rows = [json.loads(l) for l in open(results_path) if l.strip()]
@@ -596,7 +651,8 @@ def main():
     print(f"  gold-free check: all {len(rows)} flags reproduce from p_wrong >= "
           f"{thr:.3f}, no gold in features")
 
-    summary = {"arm": "ctc_validate", "n": len(rows), "threshold": thr,
+    summary = {"arm": ("ctc_validate" if a.split == "train" else "ctc_test"),
+               "split": a.split, "n": len(rows), "threshold": thr,
                "flag_rule": how, "flag_budget": a.flag_budget,
                "type_conf_gate": a.type_conf_gate, "ctc_version": ctc_version,
                "n_flagged": n_flag,
