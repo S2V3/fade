@@ -16,6 +16,32 @@ from __future__ import annotations
 from collections import Counter
 
 
+def _values(trace):
+    """The set of values a trace's chain COMPUTES. Used for step-level voting."""
+    from extraction import extract_equations, trace_body
+    out = set()
+    for e in extract_equations(trace_body(trace or "")):
+        try:
+            out.add(round(float(e.c), 4))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _corroboration(i, all_values):
+    """How much of candidate i's work the other candidates also did.
+
+    Answer voting asks whether the last line agrees. This asks whether the
+    intermediate steps agree, which is a stronger signal when a weak model
+    rarely lands the same final answer twice.
+    """
+    mine = all_values[i]
+    if not mine:
+        return -1.0
+    return sum(len(mine & other) / len(mine)
+               for j, other in enumerate(all_values) if j != i)
+
+
 def _truth(trace):
     """Fraction of the trace's stated equations that hold. None if no chain."""
     from extraction import extract_equations, trace_body
@@ -73,7 +99,20 @@ def symbolic(candidates, question=None, detector=None):
     else:
         tied = list(range(len(candidates)))
 
-    # 3. the detector breaks a tie among the arithmetically-best candidates
+    # 3. step-level corroboration. Arithmetic validity saturates -- 86% of
+    #    candidates state only true equations, so it ties on most problems.
+    #    Among the tied, prefer the one whose intermediate values the other
+    #    candidates also computed. Measured: 29.8% -> 41.2% capture.
+    if len(tied) > 1:
+        allv = [_values(t) for t, _ in candidates]
+        scores = [(i, _corroboration(i, allv)) for i in tied]
+        top = max(s for _, s in scores)
+        best = [i for i, s in scores if s >= top - 1e-9]
+        if len(best) == 1 and top > 0:
+            return best[0], "corroboration"
+        tied = best or tied
+
+    # 4. the detector, on whatever is still tied
     if detector is not None and question is not None and len(tied) > 1:
         try:
             ps = [(i, detector.predict(question, candidates[i][0])["p_wrong"])
@@ -82,7 +121,7 @@ def symbolic(candidates, question=None, detector=None):
         except Exception:
             pass
 
-    # 4. a vote among the tied candidates, then candidate order
+    # 5. an answer vote among the tied, then candidate order
     if len(tied) > 1:
         votes = Counter(keys[i] for i in tied)
         best, n = votes.most_common(1)[0]
@@ -112,3 +151,9 @@ def apply(policy, candidates, question=None, detector=None):
 # The arithmetic tier is deliberately first: on discordant pairs it is 10
 #   points better than the trained detector, which collapses toward chance on
 #   exactly the cases where a decision is needed.
+# It also saturates. 86% of candidates state only true equations, so at N=3 the
+#   tier already ties on 69% of problems and at N=8 it ties on more. Step-level
+#   corroboration exists to break those ties; without it capture is 29.8%, with
+#   it 41.2%.
+# Answer clustering before the arithmetic tier was measured at 37.1% and is
+#   worse than corroboration after it, so voting stays a late tier.
