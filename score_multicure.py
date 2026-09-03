@@ -8,7 +8,7 @@ Reports coverage (does ANY candidate get it right) separately from capture
 coverage is bounded by the model.
 
 USAGE
-    python score_multicure.py --candidates <dir>/candidates.jsonl --ctc <joblib>
+    python score_multicure.py --candidates <dir>/results.jsonl --ctc <joblib>
 """
 from __future__ import annotations
 

@@ -127,7 +127,10 @@ def main():
     knn = K._retrieval_fn("3stage")
 
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
-    path = out / "candidates.jsonl"
+    # autopush counts rows by reading results.jsonl -- writing to any
+    # other name means every checkpoint is silently skipped and a lost
+    # session loses the whole run.
+    path = out / "results.jsonl"
     done = set()
     if path.exists():
         for ln in open(path):
