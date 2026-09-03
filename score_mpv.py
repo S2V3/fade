@@ -59,6 +59,10 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--out", default=None, help="default <store>/mpv_report.json")
     ap.add_argument("--min-probes", type=int, default=1)
+    ap.add_argument("--ctc", default=None,
+                    help="ctc2.joblib. REQUIRED for a fair baseline: selector.symbolic's "
+                         "published 29.0%% result uses a detector tier, and omitting it "
+                         "handicaps the baseline MPV is being compared against.")
     ap.add_argument("--gold-jsonl", default=None,
                     help="offline gold: rows {question, answer(annotated), gold_answer}; "
                          "default loads the GSM8K split from HF")
@@ -66,6 +70,20 @@ def main():
 
     import kaggle_run as K
     K.SPLIT_TAG = a.split
+
+    # [FAIRNESS] Both selectors must see the SAME detector. selector.symbolic's
+    # cascade ends in a p_wrong tier (measured 54.8% on discordant pairs); running
+    # it with detector=None silently removes that tier and makes the baseline
+    # weaker than the one already published, which would flatter MPV.
+    detector = None
+    if a.ctc:
+        import joblib
+        detector = joblib.load(a.ctc)
+        print(f"  detector: {type(detector).__name__} from {a.ctc} "
+              "(shared by select_symbolic and select_mpv)")
+    else:
+        print("  !! no --ctc: select_symbolic loses its detector tier and is WEAKER\n"
+              "     than the published 29.0% baseline. Pass --ctc for the fair comparison.")
     root = Path(a.store)
     rows = [json.loads(l) for l in open(root / "results.jsonl") if l.strip()]
     leak = [k for r in rows for k in ("gold_answer", "correct", "true_type") if k in r]
@@ -153,15 +171,18 @@ def main():
                 veto[("kept", c1)] += 1
 
         # symbolic selector (the fade_selector baseline), same candidates
-        i_sym, _ = SEL.symbolic([(t, a_) for t, a_, _ in cands], question=q)
+        i_sym, _ = SEL.symbolic([(t, a_) for t, a_, _ in cands], question=q,
+                                detector=detector)
         arms["select_symbolic"][qid] = [c1, cr][i_sym] if cr is not None else c1
 
         # MPV without back-substitution
-        i_m, why_m, _ = mpv.select(q, cands, pr, use_backsub=False, min_probes=a.min_probes)
+        i_m, why_m, _ = mpv.select(q, cands, pr, detector=detector,
+                                   use_backsub=False, min_probes=a.min_probes)
         arms["select_mpv"][qid] = [c1, cr][i_m] if cr is not None else c1
 
         # MPV with back-substitution
-        i_b, why_b, scores = mpv.select(q, cands, pr, use_backsub=True, min_probes=a.min_probes)
+        i_b, why_b, scores = mpv.select(q, cands, pr, detector=detector,
+                                        use_backsub=True, min_probes=a.min_probes)
         if i_b < len(cands):
             cb = [c1, cr][i_b] if cr is not None else c1
         else:
