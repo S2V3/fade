@@ -71,15 +71,25 @@ def main():
     leak = [k for r in rows for k in ("gold_answer", "correct", "true_type") if k in r]
     assert not leak, f"GOLD IN THE RUN OUTPUT: {set(leak)}"
 
+    # Keyed by the PERTURBATION, so a re-run that renumbered probe_index cannot
+    # create duplicates or drop one. Probes without a model answer are dropped:
+    # a probe with no Q' solve carries no evidence and must not count as a trial.
     probes = defaultdict(dict)
     ppath = Path(a.probes) if a.probes else root / "mpv_probes.jsonl"
+    n_raw = n_noans = 0
     if ppath.exists():
         for ln in open(ppath):
-            if ln.strip():
-                d = json.loads(ln)
-                probes[d["id"]][d["probe_index"]] = mpv.Probe.from_dict(d)
+            if not ln.strip():
+                continue
+            d = json.loads(ln); n_raw += 1
+            if d.get("model_answer") is None:
+                n_noans += 1
+                continue
+            key = (round(float(d["target_value"]), 6), round(float(d["new_value"]), 6))
+            probes[d["id"]][key] = mpv.Probe.from_dict(d)
     print(f"  {len(rows)} rows | probes for {len(probes)} questions "
-          f"({sum(len(v) for v in probes.values())} probes)")
+          f"({sum(len(v) for v in probes.values())} usable of {n_raw} written; "
+          f"{n_noans} had no extractable answer on Q')")
 
     if a.gold_jsonl:
         gold = {}
@@ -99,8 +109,9 @@ def main():
         ft = getattr(diag, "ftype", None)
         return str(getattr(ft, "value", ft) or "UNCLASSIFIED")
 
-    arms = {k: {} for k in ("pass1", "replace", "select_symbolic", "select_mpv",
-                            "select_mpv_backsub")}
+    arms = {k: {} for k in ("pass1", "replace", "replace_mpv_veto", "select_symbolic",
+                            "select_mpv", "select_mpv_backsub")}
+    veto = Counter()
     reasons = Counter(); backsub_wins = Counter(); n_backsub = 0
     det = []          # (id, mpv_score or None, p_wrong, wrong?, true type)
     per_q = []
@@ -117,10 +128,29 @@ def main():
         if r.get("retry_trace"):
             cr = correct_trace(q, r["retry_trace"], g)
             cands.append((r["retry_trace"], extract_final_answer(r["retry_trace"]), "retry"))
-        pr = [probes[qid][j] for j in sorted(probes.get(qid, {}))]
+        pr = [probes[qid][k] for k in sorted(probes.get(qid, {}))]
 
         arms["pass1"][qid] = c1
         arms["replace"][qid] = cr if cr is not None else c1
+
+        # ---- MPV as a VETO on the flag ------------------------------------
+        # The break-even condition says PRECISION is what decides whether a retry
+        # pays (85.9% needed, 87.6% achieved -- a 1.7-point margin).  Agreement is
+        # the asymmetric half of the MPV signal: a trace whose program predicted
+        # the model's own answer on a perturbed question is unusually likely to be
+        # right, so retrying it is unusually likely to do damage.  This arm keeps
+        # stage 3 exactly as it is and only CANCELS the retry on supported traces.
+        supported1 = False
+        if pr:
+            s1 = mpv.score_candidates(q, [(r["trace"], a1, "pass1")], pr)[0]
+            supported1 = s1.n_agree > 0
+        if cr is not None and supported1:
+            arms["replace_mpv_veto"][qid] = c1          # retry cancelled
+            veto[("cancelled", c1)] += 1
+        else:
+            arms["replace_mpv_veto"][qid] = cr if cr is not None else c1
+            if cr is not None:
+                veto[("kept", c1)] += 1
 
         # symbolic selector (the fade_selector baseline), same candidates
         i_sym, _ = SEL.symbolic([(t, a_) for t, a_, _ in cands], question=q)
@@ -161,9 +191,47 @@ def main():
               f"   vs REPLACE: +{mr['n01']} -{mr['n10']} p={mr['p']:.4f}")
         rep[k] = {"correct": sum(v.values()), "n": n, "acc": acc,
                   "vs_pass1": mc, "vs_replace": mr}
+    print(f"\n  MPV VETO on the flag: cancelled {veto[('cancelled', True)] + veto[('cancelled', False)]} retries"
+          f"  (pass-1 was CORRECT in {veto[('cancelled', True)]} of them -- damage avoided;"
+          f" WRONG in {veto[('cancelled', False)]} -- a recovery possibly forgone)")
+    rep["veto"] = {"cancelled_pass1_correct": veto[("cancelled", True)],
+                   "cancelled_pass1_wrong": veto[("cancelled", False)],
+                   "kept_pass1_correct": veto[("kept", True)],
+                   "kept_pass1_wrong": veto[("kept", False)]}
+    _tp = veto[("kept", False)]; _fp = veto[("kept", True)]
+    if _tp + _fp:
+        print(f"  precision after veto: {_tp}/{_tp+_fp} = {_tp/(_tp+_fp):.1%}"
+              f"   (break-even 85.9%; stage 3 shipped 87.6%)")
+        rep["veto"]["precision_after"] = _tp / (_tp + _fp)
     print(f"\n  selection reasons: {dict(reasons)}")
     print(f"  back-substituted candidate chosen {n_backsub} times: "
           f"right {backsub_wins[True]}  wrong {backsub_wins[False]}")
+
+    # ---- SUPPORT PRECISION -------------------------------------------------
+    # AUROC summarises the whole ranking, but the MPV signal is ASYMMETRIC: an
+    # agreement is strong evidence, a refutation is weak (the model is only ~28%
+    # accurate on Q' too, so correct traces are routinely refuted). The number that
+    # reflects what the signal actually provides is: among pass-1 traces whose
+    # program predicted at least one probe answer, what fraction are correct --
+    # against the base rate.
+    sup = Counter()
+    for qid, ms, pw, y, t in det:
+        if ms is None:
+            continue
+        sup[(ms < 1.0, y == 0)] += 1       # (supported?, correct?)
+    n_sup = sup[(True, True)] + sup[(True, False)]
+    n_ref = sup[(False, True)] + sup[(False, False)]
+    base = (sup[(True, True)] + sup[(False, True)]) / max(n_sup + n_ref, 1)
+    print(f"\n  SUPPORT PRECISION on pass-1 traces")
+    print(f"    supported (>=1 probe agreed)  {sup[(True, True)]:>4}/{n_sup:<4} correct = "
+          f"{sup[(True, True)]/max(n_sup,1):.1%}")
+    print(f"    refuted   (no probe agreed)   {sup[(False, True)]:>4}/{n_ref:<4} correct = "
+          f"{sup[(False, True)]/max(n_ref,1):.1%}")
+    print(f"    base rate among testable                    = {base:.1%}"
+          f"   -> lift {sup[(True, True)]/max(n_sup,1)/max(base,1e-9):.2f}x")
+    rep["support_precision"] = {
+        "supported_n": n_sup, "supported_correct": sup[(True, True)],
+        "refuted_n": n_ref, "refuted_correct": sup[(False, True)], "base_rate": base}
 
     # ---- detection ---------------------------------------------------------
     have = [(s, pw, y, t) for _, s, pw, y, t in det if s is not None and pw is not None]

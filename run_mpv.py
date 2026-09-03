@@ -13,11 +13,11 @@ a selection happens later, on CPU, in score_mpv.py -- and gold is opened only th
     cpu     execute every candidate's chain on every probe,
             back-substitute the probe traces, select          <- score_mpv.py
 
-COST
-    one generation per probe.  --n-probes 1 on the 1,319-question test store is
-    ~1,300 generations; --n-probes 2 is ~2,600.  At ~10 s/probe (320 tokens, the
-    stopping criterion halts at '#### N') that is ~3.5 GPU-h and ~7 GPU-h.
-    --only-flagged restricts to the rows that carry a retry (540 on stage 3).
+COST  (MEASURED, not estimated: 15.8 s/probe on the live stage-3 run)
+    --n-probes 2, all 1,319 rows   ~1,750 probes   ~7.7 GPU-h   <- 2 Kaggle sessions
+    --n-probes 1, all 1,319 rows   ~  880 probes   ~3.9 GPU-h
+    --n-probes 2 --only-flagged    ~  720 probes   ~3.2 GPU-h   <- selection only
+    Use --dry-run first: it prints the exact probe count before any GPU is spent.
 
 RESUME
     probes are appended to <store>/mpv_probes.jsonl keyed by (id, probe index).
@@ -115,7 +115,8 @@ def main():
     if out_path.exists():
         for ln in open(out_path):
             try:
-                d = json.loads(ln); done.add((d["id"], d["probe_index"]))
+                d = json.loads(ln)
+                done.add((d["id"], d["perturbed_question"]))
             except Exception:
                 pass
         print(f"  RESUME: {len(done)} probes already generated")
@@ -140,12 +141,39 @@ def main():
     manual, _ = K.build_seeds_and_eval_order(train, a.seed_pool)
     seeds = manual.get(a.strategy, [])
     knn = K._retrieval_fn(a.retrieval)
+
+    # [PROVENANCE] The probe must be asked with the SAME exemplar context the
+    # original pass-1 used, or a disagreement measures the prompt change rather
+    # than the trace. build_seeds_and_eval_order() is deterministic, but it
+    # rebuilds its cache when the artifact is absent (a fresh Kaggle session), so
+    # print a fingerprint that can be compared against the stage-3 run instead of
+    # trusting determinism silently.
+    import hashlib
+    fp_seeds = hashlib.sha1("\u241f".join(sorted(
+        str(e.get("question", "")) for e in seeds)).encode()).hexdigest()[:12]
+    fp_pool = hashlib.sha1("\u241f".join(sorted(
+        str(e.get("question", "")) for e in pool)).encode()).hexdigest()[:12]
     print(f"  exemplars: pool {len(pool)} (gold-stripped) | seeds {len(seeds)} (top-up only)")
+    print(f"  FINGERPRINT  pool {len(pool)}/{fp_pool}   seeds {len(seeds)}/{fp_seeds}")
+    try:
+        snap = json.load(open(root / "config_snapshot.json"))
+        want = snap.get("FADE_POOL_SIZE") or snap.get("pool_size")
+        if want and int(want) != len(pool):
+            raise SystemExit(
+                f"  STOP: stage 3 used a {want}-trace pool, this run has {len(pool)}.\n"
+                f"  The probes would be asked with different exemplars than pass-1 was.")
+    except FileNotFoundError:
+        pass
+    (root / "mpv_provenance.json").write_text(json.dumps(
+        {"pool_size": len(pool), "pool_fp": fp_pool, "n_seeds": len(seeds),
+         "seeds_fp": fp_seeds, "retrieval": a.retrieval, "strategy": a.strategy,
+         "exemplar_budget": a.exemplar_budget, "max_new_tokens": a.max_new_tokens,
+         "model": a.model}, indent=2))
 
     f = open(out_path, "a")
     t0 = time.time(); n_gen = 0
     for i, (r, j, p) in enumerate(plan, 1):
-        if (r["id"], j) in done:
+        if (r["id"], p.perturbed_question) in done:
             continue
         g = gen.generate(p.perturbed_question, a.strategy, manual_exemplars=seeds,
                          pool_exemplars=pool,

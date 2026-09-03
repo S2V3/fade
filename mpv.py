@@ -136,6 +136,51 @@ def question_coverage(question: str, trace: str) -> float:
 # ============================================================================
 # 2. SYMBOLIC EXECUTION under a set of substitutions
 # ============================================================================
+def ambiguous_reread(eqs, subs) -> bool:
+    """True when a substituted question number is RE-READ later in the chain at a
+    point where it could equally be an earlier step's result.
+
+    Numbers in a chain carry no provenance.  In cv_00002 the model wrote
+    "2 x 1 = 2 ; 2 / 2 = 1 ; 2 + 1 = 3": under 2 -> 4 the divisor 2 (which meant
+    "half") is rewritten to 4, giving 5 instead of 6, and a CORRECT trace is
+    falsely refuted.
+
+    MEASURED, and the reason ABSTAIN_ON_COLLISION defaults to False: switching this
+    on drops testable train traces from 996 to 915 (66.4% -> 61.0%) while the
+    false-refutation rate on correct traces is UNCHANGED (22.3% -> 22.4%).  It buys
+    nothing and costs 5.4 points of coverage.  Kept as an auditable switch, and
+    surfaced per candidate as CandidateScore.n_ambiguous, rather than deleted.
+    """
+    olds = [float(o) for o, _ in subs]
+    if not olds:
+        return False
+    seen: list[float] = []
+    for e in eqs:
+        lhs = e.raw.split("=")[0] if "=" in e.raw else e.raw
+        for tok in _NUM.finditer(_normalise_math_text(lhs)):
+            v = float(tok.group())
+            if any(_close(v, o) for o in olds) and any(_close(v, r) for r in seen):
+                return True
+        seen.append(float(e.c))
+    return False
+
+
+ABSTAIN_ON_COLLISION = False
+"""Whether execute() refuses to run a chain whose substituted value collides with an
+earlier step's result.
+
+MEASURED, and the reason it is OFF.  Colliding probes are not actually worse: on
+correct traces they predict the perturbed question's true answer 85.3% of the time
+(n=34) against 77.3% for non-colliding ones (n=608).  Turning the abstain ON drops
+testable train traces from 996 to 915 (66.4% -> 61.0%) to avoid a failure mode that
+is rare AND nearly costless: because select() only ever PROMOTES on agreement and
+never DEMOTES on refutation (see the asymmetry note there), a false refutation
+merely fails to help -- it cannot push a correct trace below a wrong one.
+
+Kept as a switch, and reported per candidate via CandidateScore.n_ambiguous, so the
+choice is auditable rather than silent."""
+
+
 def execute(trace: str, subs: list[tuple[float, float]], final_answer) -> Optional[float]:
     """Run the trace's own chain with `subs` = [(old, new), ...] applied to the
     question numbers, propagating changed intermediate results downstream exactly
@@ -148,6 +193,8 @@ def execute(trace: str, subs: list[tuple[float, float]], final_answer) -> Option
     eqs = extract_equations(trace_body(trace or ""))
     if not eqs or not any(_close(e.c, final_answer) for e in eqs):
         return None
+    if ABSTAIN_ON_COLLISION and ambiguous_reread(eqs, subs):
+        return None
     live = [(float(o), float(n)) for o, n in subs]
     for e in eqs:
         lhs = e.raw.split("=")[0] if "=" in e.raw else e.raw
@@ -155,6 +202,8 @@ def execute(trace: str, subs: list[tuple[float, float]], final_answer) -> Option
         if val is None:
             continue
         if not _close(val, e.c):
+            if ABSTAIN_ON_COLLISION and any(_close(e.c, o) for o, _ in live):
+                return None          # this result collides with a live substitution
             live.append((float(e.c), float(val)))
     for old, new in live[len(subs):]:
         if _close(final_answer, old):
@@ -234,9 +283,19 @@ def make_probes(question: str, traces: list[str], n_probes: int = 2,
     from extraction import extract_final_answer as _fa
     answers = [_fa(t) for t in traces]
 
+    # Prefer targets that do NOT collide with any candidate's intermediate results:
+    # a colliding probe makes every candidate abstain, so the generation is wasted.
+    def _collides(v):
+        for t in traces:
+            eqs = extract_equations(trace_body(t or ""))
+            if eqs and ambiguous_reread(eqs, [(v, v + 1.0)]):
+                return True
+        return False
+    clean = [(v, sp) for v, sp in reversed(targets) if not _collides(v)]
+    dirty = [(v, sp) for v, sp in reversed(targets) if _collides(v)]
     plan = []
     for f in factors:
-        for v, sp in reversed(targets):
+        for v, sp in clean + dirty:
             plan.append((v, sp, f))
     probes, seen = [], set()
     for v, sp, f in plan:
@@ -321,6 +380,7 @@ class CandidateScore:
     n_applicable: int = 0         # probes on which the chain could be executed
     n_agree: int = 0              # ... and predicted the model's probe answer
     n_program_agree: int = 0      # probe trace computed the same abstract program
+    n_ambiguous: int = 0          # probes where a value-provenance collision exists
     arith_truth: Optional[float] = None
     coverage: float = 0.0
     signature: str = ""
@@ -347,12 +407,15 @@ def score_candidates(question: str, candidates: list[tuple[str, Optional[float],
                             coverage=question_coverage(question, trace),
                             signature=abstract_program(question, trace))
         src_probe = int(origin.split(":")[1]) if origin.startswith("backsub:") else -1
+        eqs_c = extract_equations(trace_body(trace or ""))
         for j, p in enumerate(probes):
             if p.model_answer is None or j == src_probe:
                 continue                      # a back-substitution never grades its own probe
             pred = execute(trace, p.subs, ans)
             if pred is None:
                 continue
+            if ambiguous_reread(eqs_c, p.subs):
+                cs.n_ambiguous += 1
             cs.n_applicable += 1
             if _close(pred, p.model_answer):
                 cs.n_agree += 1
@@ -401,7 +464,17 @@ def select(question: str, candidates: list[tuple[str, Optional[float], str]],
     scores = score_candidates(question, cands, probes)
 
     keys = [s.answer for s in scores]
-    if len(set(k for k in keys if k is not None)) <= 1:
+    live_ans = set(k for k in keys if k is not None)
+    if len(live_ans) <= 1:
+        # every candidate that produced an answer produced the SAME one -- nothing
+        # to choose.  Return a candidate that actually HAS that answer: candidate 0
+        # may have failed to emit one, and returning it would silently discard a
+        # perfectly good answer from a later candidate.
+        if not live_ans:
+            return 0, "empty", scores
+        for s in scores:
+            if s.answer is not None:
+                return s.index, "agree", scores
         return 0, "agree", scores
 
     tied = [s for s in scores if s.answer is not None] or scores
@@ -469,4 +542,7 @@ def detection_score(question: str, trace: str, answer, probes: list[Probe]) -> O
     s = score_candidates(question, [(trace, answer, "x")], probes)[0]
     if not s.n_applicable:
         return None
-    return 1.0 - s.n_agree / s.n_applicable
+    # Answer agreement is the strong evidence; program agreement is partial credit,
+    # and it breaks the ties that a pure 0/1 rate produces at this probe count.
+    support = min(s.n_applicable, s.n_agree + 0.5 * s.n_program_agree)
+    return 1.0 - support / s.n_applicable
