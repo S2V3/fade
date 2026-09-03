@@ -1,0 +1,11 @@
+{
+  "pool_size": 361,
+  "pool_fp": "b44be787fea3",
+  "n_seeds": 40,
+  "seeds_fp": "fbf8ae6fb928",
+  "retrieval": "3stage",
+  "strategy": 2,
+  "exemplar_budget": 8,
+  "max_new_tokens": 320,
+  "model": "meta-llama/Llama-2-7b-chat-hf"
+}
