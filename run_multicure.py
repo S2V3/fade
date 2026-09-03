@@ -78,6 +78,24 @@ def main():
     if not hasattr(K, "apply_cure"):
         raise SystemExit("kaggle_run.py has no apply_cure() -- push the updated file")
 
+    # Check every signature this script depends on BEFORE the model loads. A
+    # keyword that does not exist costs 70 seconds of weight loading to discover
+    # otherwise, and that is how the first version of this script died.
+    import inspect
+    for fn, need in ((G.ExemplarGenerator._run_model,
+                      ("temperature", "max_new_tokens", "num_return_sequences",
+                       "return_logprobs", "problem")),
+                     (G._build_prompt, ("sid", "problem", "manual_exemplars",
+                                        "pool_exemplars", "cat_info", "knn_fn")),
+                     (K.apply_cure, ("mode", "budget", "rec_id"))):
+        have = set(inspect.signature(fn).parameters)
+        missing = [k for k in need if k not in have]
+        if missing:
+            raise SystemExit(
+                f"  {fn.__qualname__} is missing {missing}.\n"
+                "  The repo copy is out of date -- push it and re-run.")
+    print("  signature guard passed")
+
     cures = distinct_cures()
     print("=" * 66)
     print(f"  {len(cures)} distinct cures: {', '.join(c.value for c in cures)}")
@@ -140,14 +158,22 @@ def main():
             rec["cures"].append({"type": ft.value, "trace": tr,
                                  "answer": G.extract_final_answer(tr)})
 
-        # the compute-matched resample arm: same count, temperature diversity
+        # The compute-matched resample arm: the SAME pass-1 prompt, drawn at
+        # temperature. generate() decodes greedily and takes no temperature, so
+        # the prompt is built once and _run_model is called directly -- the same
+        # path apply_cure uses for a retry.
         info = cat.categorize(q)
+        prompt, _ = G._build_prompt(2, q, seeds, pool, info, knn)
         for _ in range(len(cures)):
-            res = gen.generate(q, 2, manual_exemplars=seeds, pool_exemplars=pool,
-                               category_info=info, max_new_tokens=a.max_new_tokens,
-                               return_logprobs=False, knn_fn=knn,
-                               temperature=a.temp)
-            tr = res["trace"]
+            traces, _ = gen._run_model(prompt, temperature=a.temp,
+                                       max_new_tokens=a.max_new_tokens,
+                                       num_return_sequences=1,
+                                       return_logprobs=False, problem=q)
+            # _run_model skips the canonical '#### N' line that generate()
+            # appends. Without this the resample arm is scored through a weaker
+            # answer path than the cures and loses recall it did not really lose.
+            tr, _h = G.ensure_hash_line_flagged(
+                traces[0], G.extract_final_answer(traces[0]))
             rec["temps"].append({"trace": tr, "answer": G.extract_final_answer(tr)})
 
         f.write(json.dumps(rec) + "\n"); f.flush()
