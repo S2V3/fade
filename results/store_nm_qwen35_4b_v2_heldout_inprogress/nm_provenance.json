@@ -39,6 +39,31 @@
         "--secret-name",
         "HF_TOKEN"
       ]
+    },
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "dtype": "fp16",
+      "test_dataset": "gsm8k",
+      "top_k_normalised": 50,
+      "chat_mode": false,
+      "enable_thinking": false,
+      "transformers": "5.17.0",
+      "torch": "2.10.0+cu128",
+      "script": "run_baselines.py",
+      "argv": [
+        "--store",
+        "/kaggle/working/stores/store_nm_qwen35_4b_v2_heldout",
+        "--pool-store",
+        "/kaggle/working/stores/store_nm_qwen35_4b_v2_train",
+        "--model",
+        "Qwen/Qwen3.5-4B",
+        "--arms",
+        "resample,generic",
+        "--max-new-tokens",
+        "1024",
+        "--secret-name",
+        "HF_TOKEN"
+      ]
     }
   ]
 }
