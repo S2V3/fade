@@ -62,8 +62,13 @@ class Cfg:
     n_test: int = 400                   # first N GSM8K test questions (paired with Llama-2)
     n_p1: int = 400                     # GSM-Symbolic P1, 4 instances x 100 templates
     p1_variant: str = "gsm_symbolic_p1"
-    train_max_tok: int = 400            # what the Llama-2 typed train run used
-    eval_max_tok: int = 320             # what Llama-2 stage 2/3 and probes used
+    # Generation caps. Llama-2 ran at 400 (train) / 320 (eval) and rarely hit them.
+    # Qwen3.5 writes 2-3x longer traces: at 400, 28% of its train traces hit the cap
+    # and were right 13% of the time -- truncation, not reasoning. The rule we keep
+    # across models is "the cap must not bind", so non-Llama models default to 1024.
+    train_max_tok: int | None = None    # None -> 400 for Llama-2, 1024 otherwise
+    eval_max_tok: int | None = None     # None -> 320 for Llama-2, 1024 otherwise
+    run_version: str = "v2"             # v1 = the 26 Sep Qwen run (3072-token prompt cut, 400 cap)
     n_probes: int = 1                   # the paper's results used ~1 probe per question
     flag_budget: float | None = None    # None -> nm_pick_budget.py decides (Qwen)
     llama_flag_budget: float = 0.40     # what Llama-2 stage 3 shipped
@@ -71,12 +76,21 @@ class Cfg:
     hf_secret: str = "HF_TOKEN"
     push_minutes: int = 10
 
+    def __post_init__(self):
+        legacy = "llama-2" in self.model.lower()
+        if self.train_max_tok is None:
+            self.train_max_tok = 400 if legacy else 1024
+        if self.eval_max_tok is None:
+            self.eval_max_tok = 320 if legacy else 1024
+
     @property
     def tag(self) -> str:
         m = self.model.lower()
         if "qwen3.5" in m:
-            return "qwen35_" + m.split("-")[-1].replace(".", "")          # qwen35_4b
-        return "".join(c for c in m.split("/")[-1] if c.isalnum())[:16]
+            base = "qwen35_" + m.split("-")[-1].replace(".", "")          # qwen35_4b
+        else:
+            base = "".join(c for c in m.split("/")[-1] if c.isalnum())[:16]
+        return base if self.run_version in ("", "v1") else f"{base}_{self.run_version}"
 
 
 # =============================================================================
@@ -132,11 +146,14 @@ class Lane(threading.Thread):
             except Exception as e:
                 self.ok, self.error = False, repr(e)
                 self.say(f"STOPPED on {getattr(st, '__name__', st)}: {e}")
+                mark(f"FAILED_{self.name_}")      # so a lane waiting on this one stops too
                 break
         self.say(f"lane finished ({'ok' if self.ok else 'FAILED'}) in {(time.time()-t0)/3600:.2f} h")
 
 
 def run_lanes(lanes):
+    for p in (MARKS.glob("FAILED_*") if MARKS.exists() else []):
+        p.unlink()                                  # a re-run starts with a clean slate
     for ln in lanes:
         ln.start()
     for ln in lanes:
@@ -172,6 +189,9 @@ def wait_for(name, poll=30):
     def _s(lane):
         lane.say(f"waiting for {name} ...")
         while not is_marked(name):
+            failed = [p.name for p in MARKS.glob("FAILED_*")] if MARKS.exists() else []
+            if failed:
+                raise RuntimeError(f"not waiting for {name}: {failed} failed -- fix and re-run the cell")
             time.sleep(poll)
         lane.say(f"{name} is done, continuing")
     _s.__name__ = f"wait[{name}]"
@@ -222,7 +242,8 @@ def prepare(cfg):
             {"model": cfg.model, "dtype": cfg.dtype, "n_train": cfg.n_train,
              "n_heldout": cfg.n_heldout, "n_test": cfg.n_test, "n_p1": cfg.n_p1,
              "p1_variant": cfg.p1_variant, "train_max_tok": cfg.train_max_tok,
-             "eval_max_tok": cfg.eval_max_tok, "n_probes": cfg.n_probes}, indent=2))
+             "eval_max_tok": cfg.eval_max_tok, "n_probes": cfg.n_probes,
+             "run_version": cfg.run_version}, indent=2))
         if cfg.gh_token:
             NS.Pusher(P["train"], f"nm_{cfg.tag}_train", cfg.gh_token).push_now(final=True)
             NS.Pusher(P["ctc"], f"nm_{cfg.tag}_ctc", cfg.gh_token).push_now(final=True)
@@ -260,6 +281,7 @@ def budget_of(cfg):
 def chain(cfg, run, *, model, pool, ctc, split, offset, n, dataset="gsm8k",
           budget=None, score=False, probes=True, baselines=True):
     store = STORES / f"store_{run}"
+    max_tok = 320 if model == LLAMA else cfg.eval_max_tok
     env = {"FADE_DTYPE": cfg.dtype if model != LLAMA else "fp16",
            "FADE_TEST_DATASET": dataset}
 
@@ -270,16 +292,16 @@ def chain(cfg, run, *, model, pool, ctc, split, offset, n, dataset="gsm8k",
            f"--ctc {ctc} --pool-store {pool} --store-dir {store} --n-problems {n} "
            f"--split {split} --eval-offset {offset} {'' if score else '--no-score'} "
            f"--flag-budget {b} --type-conf-gate 0.5 --retry-flagged --retrieval 3stage "
-           f"--model {model} --max-new-tokens {cfg.eval_max_tok} --show-every 25 "
+           f"--model {model} --max-new-tokens {max_tok} --show-every 25 "
            f"--secret-name {cfg.hf_secret}", env=env)
         if probes:
             py(lane, "run_mpv.py",
                f"--store {store} --pool-store {pool} --model {model} --n-probes {cfg.n_probes} "
-               f"--max-new-tokens {cfg.eval_max_tok} --secret-name {cfg.hf_secret}", env=env)
+               f"--max-new-tokens {max_tok} --secret-name {cfg.hf_secret}", env=env)
         if baselines:
             py(lane, "run_baselines.py",
                f"--store {store} --pool-store {pool} --model {model} --arms resample,generic "
-               f"--max-new-tokens {cfg.eval_max_tok} --secret-name {cfg.hf_secret}", env=env)
+               f"--max-new-tokens {max_tok} --secret-name {cfg.hf_secret}", env=env)
         mark(run)
     return with_push(run, store, cfg, body)
 
@@ -335,7 +357,7 @@ def llama_gsm8k_baselines(cfg):
             NS.subset(tmp, store, cfg.n_test)
         py(lane, "run_baselines.py",
            f"--store {store} --pool-store {pool} --model {LLAMA} --arms resample,generic "
-           f"--max-new-tokens {cfg.eval_max_tok} --secret-name {cfg.hf_secret}")
+           f"--max-new-tokens 320 --secret-name {cfg.hf_secret}")
         mark(run)
     return with_push(run, store, cfg, body)
 

@@ -79,10 +79,43 @@ def _wrap_chat_template(tok):
     return tok
 
 
+MAX_PROMPT_TOKENS = int(os.environ.get("FADE_MAX_PROMPT_TOKENS", "16384"))
+
+
+def raise_prompt_limit(limit: int = MAX_PROMPT_TOKENS) -> None:
+    """[NM-2] generation.py truncates every prompt at a hard-coded 3072 tokens, and
+    the tokenizer truncates from the RIGHT -- the end of the prompt, where the live
+    question and the assistant turn sit. Llama-2 prompts stayed under it. Qwen's own
+    pool exemplars are much longer, so 35 of the first 500 Qwen train prompts
+    (7%) were cut, and those traces were right 11% of the time against 72% for the
+    rest: the model was answering a question it never saw.
+
+    Rebuilds ExemplarGenerator._run_model from its own source with 3072 replaced by
+    `limit` (Qwen3.5 has a 262k context). Nothing else in the method changes, and
+    Llama-2 never calls this, so its path stays byte-identical to the paper's."""
+    import inspect
+    import textwrap
+    cls = G.ExemplarGenerator
+    if getattr(cls._run_model, "_nm_limit", None) == limit:
+        return
+    src = textwrap.dedent(inspect.getsource(cls._run_model))
+    if src.count("3072") != 3:
+        raise SystemExit("  STOP: generation._run_model changed; cannot raise the 3072 prompt limit safely")
+    src = src.replace("3072", "_NM_MAX_PROMPT_TOKENS")
+    G._NM_MAX_PROMPT_TOKENS = int(limit)
+    ns = {}
+    exec(compile(src, "<nm_patch:_run_model>", "exec"), G.__dict__, ns)
+    fn = ns["_run_model"]
+    fn._nm_limit = limit
+    cls._run_model = fn
+    print(f"  [NM-2] prompt truncation limit raised 3072 -> {limit} tokens (non-Llama-2 only)")
+
+
 def load_model(token):
     """Drop-in for kaggle_run.load_model. Llama-2 -> the original, untouched."""
     if is_legacy_llama2(K.MODEL_ID):
         return _ORIG_LOAD_MODEL(token)
+    raise_prompt_limit()
     import time
     import torch
     import transformers
