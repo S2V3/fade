@@ -1,0 +1,15 @@
+{
+  "pool_size": 361,
+  "pool_fp": "b44be787fea3",
+  "seeds_fp": "fbf8ae6fb928",
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "arms": [
+    "resample",
+    "generic"
+  ],
+  "max_new_tokens": 320,
+  "exemplar_budget": 8,
+  "retrieval": "3stage",
+  "resample_rule": "generation.py strategy 2 (pass-1 procedure, T=0.7, top_p=0.95)",
+  "generic_rule": "kaggle_run.apply_cure(mode='generic'), T=0 (greedy)"
+}
