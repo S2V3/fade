@@ -1,0 +1,4 @@
+  pass-1 traces 500   testable 211 (42.2%)
+  program prediction vs GOLD answer of the perturbed question:
+    correct traces: match   202  mismatch   186  abstain    0   -> P(pred == gold') = 0.521
+    wrong   traces: match     0  mismatch    34  abstain    0   -> P(pred == gold') = 0.000
