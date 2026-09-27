@@ -1,0 +1,102 @@
+{
+  "strategy_id": 2,
+  "strategy_name": "few_shot",
+  "generation_version": "v5-hashline",
+  "embedding_backend": "minilm",
+  "retrieval": "3stage",
+  "model": "Qwen/Qwen3.5-4B",
+  "split": "train",
+  "retry_mode": "typed+neg",
+  "n_negatives": 2,
+  "exemplar_budget": 8,
+  "n_problems": 250,
+  "eval_offset": 0,
+  "eval_range": [
+    1,
+    250
+  ],
+  "pass1_correct": 228,
+  "pass1_accuracy": 0.912,
+  "final_correct": 233,
+  "final_accuracy": 0.932,
+  "recovered_by_retry": 5,
+  "pool_entries_from_retry": 0,
+  "final_pool_size": 108,
+  "pass1_diagnosis_distribution": {
+    "AL": 20,
+    "TR": 6,
+    "CE": 1,
+    "WP": 2,
+    "UNCLASSIFIED": 1
+  },
+  "extraction_diagnostics": {
+    "traces_with_hash": 250,
+    "hash_natively_emitted": 230,
+    "highE_but_wrong": 13,
+    "gold_in_trace_but_wrong": 13
+  },
+  "iterations": [
+    {
+      "iter": 1,
+      "MEDIUM": {
+        "retried": 3,
+        "transitions": {
+          "BAD_WRONG": 1,
+          "MEDIUM_WRONG": 2
+        },
+        "newly_correct": 0,
+        "pool_entries": 0,
+        "recovery_by_prior_diagnosis": {}
+      },
+      "BAD": {
+        "retried": 19,
+        "transitions": {
+          "MEDIUM_WRONG": 4,
+          "BAD_WRONG": 10,
+          "MEDIUM_CORRECT": 5
+        },
+        "newly_correct": 5,
+        "pool_entries": 0,
+        "recovery_by_prior_diagnosis": {
+          "TR": 3,
+          "AL": 2
+        }
+      },
+      "retry_worthiness_gap": -0.2632
+    }
+  ],
+  "per_category_accuracy": {
+    "counting": {
+      "correct": 97,
+      "total": 110,
+      "acc": 0.8818
+    },
+    "logic": {
+      "correct": 4,
+      "total": 5,
+      "acc": 0.8
+    },
+    "monetary": {
+      "correct": 52,
+      "total": 57,
+      "acc": 0.9123
+    },
+    "rate": {
+      "correct": 16,
+      "total": 16,
+      "acc": 1.0
+    },
+    "time": {
+      "correct": 51,
+      "total": 62,
+      "acc": 0.8226
+    }
+  },
+  "cost": {
+    "generations": 2,
+    "approx_tokens": 1191,
+    "sec_per_generation": 55.0,
+    "wall_seconds": 110,
+    "projected_full_gsm8k_gpu_hours": 114.17
+  }
+}

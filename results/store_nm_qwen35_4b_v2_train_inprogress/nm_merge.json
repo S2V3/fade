@@ -1,0 +1,10 @@
+{
+  "shards": [
+    "store_nm_qwen35_4b_v2_train_s0",
+    "store_nm_qwen35_4b_v2_train_s1"
+  ],
+  "lines": {
+    "store_nm_qwen35_4b_v2_train_s0": 818,
+    "store_nm_qwen35_4b_v2_train_s1": 821
+  }
+}
