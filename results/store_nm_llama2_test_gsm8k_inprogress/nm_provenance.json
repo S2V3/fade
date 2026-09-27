@@ -1,0 +1,29 @@
+{
+  "stages": [
+    {
+      "model": "meta-llama/Llama-2-7b-chat-hf",
+      "dtype": "fp16",
+      "test_dataset": "gsm8k",
+      "top_k_normalised": 50,
+      "chat_mode": false,
+      "enable_thinking": false,
+      "transformers": "5.17.0",
+      "torch": "2.10.0+cu128",
+      "script": "run_baselines.py",
+      "argv": [
+        "--store",
+        "/kaggle/working/stores/store_nm_llama2_test_gsm8k",
+        "--pool-store",
+        "/kaggle/working/stores/llama2_pool",
+        "--model",
+        "meta-llama/Llama-2-7b-chat-hf",
+        "--arms",
+        "resample,generic",
+        "--max-new-tokens",
+        "320",
+        "--secret-name",
+        "HF_TOKEN"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "arm": "ctc_test",
+  "split": "test",
+  "n": 1319,
+  "threshold": 0.683,
+  "flag_rule": "--flag-budget 40% -> p_wrong >= 0.683 (FALLBACK: this model shipped no calibration table -- retrain with the D77 ctc_train2.py to calibrate on your own data)",
+  "flag_budget": 0.4,
+  "type_conf_gate": 0.5,
+  "ctc_version": 2,
+  "n_flagged": 540,
+  "eval_offset": 0,
+  "model": "meta-llama/Llama-2-7b-chat-hf",
+  "retry_flagged": true,
+  "retrieval": "3stage",
+  "pool_size": 361,
+  "exemplars_from_pool_probe": 8
+}
