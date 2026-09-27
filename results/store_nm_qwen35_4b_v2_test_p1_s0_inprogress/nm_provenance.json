@@ -1,0 +1,45 @@
+{
+  "stages": [
+    {
+      "model": "Qwen/Qwen3.5-4B",
+      "dtype": "fp16",
+      "test_dataset": "gsm_symbolic_p1",
+      "top_k_normalised": 50,
+      "chat_mode": false,
+      "enable_thinking": false,
+      "transformers": "5.17.0",
+      "torch": "2.10.0+cu128",
+      "script": "run_ctc_validate.py",
+      "argv": [
+        "--ctc",
+        "/kaggle/working/stores/nm_qwen35_4b_v2_ctc/ctc2.joblib",
+        "--pool-store",
+        "/kaggle/working/stores/store_nm_qwen35_4b_v2_train",
+        "--store-dir",
+        "/kaggle/working/stores/store_nm_qwen35_4b_v2_test_p1_s0",
+        "--n-problems",
+        "200",
+        "--split",
+        "test",
+        "--eval-offset",
+        "0",
+        "--no-score",
+        "--flag-budget",
+        "0.1",
+        "--type-conf-gate",
+        "0.5",
+        "--retry-flagged",
+        "--retrieval",
+        "3stage",
+        "--model",
+        "Qwen/Qwen3.5-4B",
+        "--max-new-tokens",
+        "1024",
+        "--show-every",
+        "25",
+        "--secret-name",
+        "HF_TOKEN"
+      ]
+    }
+  ]
+}
