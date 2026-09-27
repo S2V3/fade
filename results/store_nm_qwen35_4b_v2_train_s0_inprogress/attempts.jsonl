@@ -247,3 +247,17 @@
 {"id": "p1_00247", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
 {"id": "p1_00248", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
 {"id": "p1_00249", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00250", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00049", "iter": 1, "origin": "MEDIUM", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00090", "iter": 1, "origin": "MEDIUM", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "WP"}
+{"id": "p1_00193", "iter": 1, "origin": "MEDIUM", "label": "MEDIUM_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00237", "iter": 1, "origin": "MEDIUM", "label": "MEDIUM_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00005", "iter": 1, "origin": "BAD", "label": "MEDIUM_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00015", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00029", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "TR"}
+{"id": "p1_00054", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "CE"}
+{"id": "p1_00056", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "WP"}
+{"id": "p1_00069", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00072", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00076", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00088", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
