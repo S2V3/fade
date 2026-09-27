@@ -1,0 +1,45 @@
+{
+  "stages": [
+    {
+      "model": "meta-llama/Llama-2-7b-chat-hf",
+      "dtype": "fp16",
+      "test_dataset": "gsm_symbolic_p1",
+      "top_k_normalised": 50,
+      "chat_mode": false,
+      "enable_thinking": false,
+      "transformers": "5.17.0",
+      "torch": "2.10.0+cu128",
+      "script": "run_ctc_validate.py",
+      "argv": [
+        "--ctc",
+        "/kaggle/working/stores/llama2_ctc/ctc2.joblib",
+        "--pool-store",
+        "/kaggle/working/stores/llama2_pool",
+        "--store-dir",
+        "/kaggle/working/stores/store_nm_llama2_test_p1",
+        "--n-problems",
+        "400",
+        "--split",
+        "test",
+        "--eval-offset",
+        "0",
+        "--no-score",
+        "--flag-budget",
+        "0.4",
+        "--type-conf-gate",
+        "0.5",
+        "--retry-flagged",
+        "--retrieval",
+        "3stage",
+        "--model",
+        "meta-llama/Llama-2-7b-chat-hf",
+        "--max-new-tokens",
+        "320",
+        "--show-every",
+        "25",
+        "--secret-name",
+        "HF_TOKEN"
+      ]
+    }
+  ]
+}
