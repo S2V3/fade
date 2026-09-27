@@ -1,0 +1,17 @@
+{
+  "arm": "ctc_test",
+  "split": "test",
+  "n": 200,
+  "threshold": 0.48249424007117336,
+  "flag_rule": "--flag-budget 10% -> p_wrong >= 0.482 (stage-1 calibration on pass1 traces, precision 70.0%)",
+  "flag_budget": 0.1,
+  "type_conf_gate": 0.5,
+  "ctc_version": 2,
+  "n_flagged": 52,
+  "eval_offset": 0,
+  "model": "Qwen/Qwen3.5-4B",
+  "retry_flagged": true,
+  "retrieval": "3stage",
+  "pool_size": 203,
+  "exemplars_from_pool_probe": 8
+}

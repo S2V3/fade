@@ -1,0 +1,11 @@
+{
+  "pool_size": 203,
+  "pool_fp": "4e6661087756",
+  "n_seeds": 40,
+  "seeds_fp": "fbf8ae6fb928",
+  "retrieval": "3stage",
+  "strategy": 2,
+  "exemplar_budget": 8,
+  "max_new_tokens": 1024,
+  "model": "Qwen/Qwen3.5-4B"
+}
