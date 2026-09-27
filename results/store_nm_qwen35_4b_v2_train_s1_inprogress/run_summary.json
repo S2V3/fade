@@ -1,0 +1,48 @@
+{
+  "status": "pass1_complete_retries_pending",
+  "n_problems": 250,
+  "pass1_correct": 217,
+  "pass1_accuracy": 0.868,
+  "final_correct": 217,
+  "final_accuracy": 0.868,
+  "recovered_by_retry": 0,
+  "final_pool_size": 90,
+  "iterations": [],
+  "model": "Qwen/Qwen3.5-4B",
+  "split": "train",
+  "retry_mode": "typed+neg",
+  "pass1_diagnosis_distribution": {
+    "TR": 7,
+    "AL": 21,
+    "NR": 2,
+    "ST": 1,
+    "CE": 2
+  },
+  "per_category_accuracy": {
+    "time": {
+      "correct": 54,
+      "total": 67,
+      "acc": 0.8059701492537313
+    },
+    "counting": {
+      "correct": 98,
+      "total": 106,
+      "acc": 0.9245283018867925
+    },
+    "monetary": {
+      "correct": 50,
+      "total": 60,
+      "acc": 0.8333333333333334
+    },
+    "logic": {
+      "correct": 5,
+      "total": 5,
+      "acc": 1.0
+    },
+    "rate": {
+      "correct": 10,
+      "total": 12,
+      "acc": 0.8333333333333334
+    }
+  }
+}

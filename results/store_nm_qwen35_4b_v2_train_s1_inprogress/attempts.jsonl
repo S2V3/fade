@@ -231,3 +231,22 @@
 {"id": "p1_00481", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
 {"id": "p1_00482", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
 {"id": "p1_00483", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00484", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00485", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00486", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00487", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00488", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00489", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00490", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00491", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00492", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00493", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00494", "pass_": 1, "label": "BAD_WRONG", "correct": false, "diagnosis": "AL"}
+{"id": "p1_00495", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00496", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00497", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00498", "pass_": 1, "label": "GOOD", "correct": true, "diagnosis": null}
+{"id": "p1_00499", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00500", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
+{"id": "p1_00265", "iter": 1, "origin": "MEDIUM", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00403", "iter": 1, "origin": "MEDIUM", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
