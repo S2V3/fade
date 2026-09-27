@@ -250,3 +250,14 @@
 {"id": "p1_00500", "pass_": 1, "label": "MEDIUM_CORRECT", "correct": true, "diagnosis": null}
 {"id": "p1_00265", "iter": 1, "origin": "MEDIUM", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
 {"id": "p1_00403", "iter": 1, "origin": "MEDIUM", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00254", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00256", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00261", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "NR"}
+{"id": "p1_00263", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00270", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00271", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00273", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00280", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00282", "iter": 1, "origin": "BAD", "label": "MEDIUM_WRONG", "correct": false, "prev_diagnosis": "ST"}
+{"id": "p1_00283", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00284", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
