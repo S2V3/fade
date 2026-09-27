@@ -261,3 +261,14 @@
 {"id": "p1_00282", "iter": 1, "origin": "BAD", "label": "MEDIUM_WRONG", "correct": false, "prev_diagnosis": "ST"}
 {"id": "p1_00283", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
 {"id": "p1_00284", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00295", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00303", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "TR"}
+{"id": "p1_00324", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00329", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00338", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00343", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00345", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "AL"}
+{"id": "p1_00347", "iter": 1, "origin": "BAD", "label": "GOOD", "correct": true, "prev_diagnosis": "AL"}
+{"id": "p1_00348", "iter": 1, "origin": "BAD", "label": "MEDIUM_CORRECT", "correct": true, "prev_diagnosis": "TR"}
+{"id": "p1_00390", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "NR"}
+{"id": "p1_00392", "iter": 1, "origin": "BAD", "label": "BAD_WRONG", "correct": false, "prev_diagnosis": "TR"}
