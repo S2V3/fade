@@ -1,0 +1,15 @@
+{
+  "pool_size": 203,
+  "pool_fp": "4e6661087756",
+  "seeds_fp": "fbf8ae6fb928",
+  "model": "Qwen/Qwen3.5-4B",
+  "arms": [
+    "resample",
+    "generic"
+  ],
+  "max_new_tokens": 1024,
+  "exemplar_budget": 8,
+  "retrieval": "3stage",
+  "resample_rule": "generation.py strategy 2 (pass-1 procedure, T=0.7, top_p=0.95)",
+  "generic_rule": "kaggle_run.apply_cure(mode='generic'), T=0 (greedy)"
+}
