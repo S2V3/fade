@@ -1,0 +1,788 @@
+# FADE — project record
+Training-free reasoning repair, and gold-free verification, for a frozen LLaMA-2-7B-chat on
+GSM8K. A complete account of the method, the measurements, the bugs measurement exposed, and
+the conclusions that survived them.
+**Every number here was produced by the harness. Nothing is estimated unless it says so.**
+| | |
+|---|---|
+| Model | LLaMA-2-7B-chat, frozen |
+| Task | GSM8K |
+| Weight updates | zero |
+| LLM judges | zero |
+| Gold visible to the model | never, on any split |
+| Test set | 1,319 questions, no gold in the loop |
+> **Status: unpublished.** This document describes work under submission to a double-blind
+> venue. Keep it out of any public location until that changes.
+---
+## Contents
+1. [The idea](#1--the-idea-and-why-it-is-not-just-prompting)
+2. [The instrument](#2--the-instrument-measuring-a-trace-without-a-judge)
+3. [Failure taxonomy](#3--the-failure-taxonomy-and-the-diagnostic-cascade)
+4. [Retrieval, in detail](#4--retrieval-in-detail)
+5. [Phase 1 — deferred retry](#5--phase-1--deferred-retry-the-pool-builder)
+6. [Phase 2 — EDER](#6--phase-2--eder-and-the-anatomy-of-a-cure)
+7. [Phase 3 — CTC](#7--phase-3--ctc-the-part-that-makes-it-deployable)
+8. [The break-even condition](#8--the-break-even-condition-the-equation-that-governs-everything)
+9. [Phase 4 — MPV](#9--phase-4--mpv-verifying-a-trace-against-the-questions-number-family)
+10. [Bugs only measurement could find](#10--bugs-that-only-measurement-could-find)
+11. [Results](#11--results)
+12. [What is true](#12--what-is-true-what-is-not-and-what-is-undecided)
+13. [Running it](#13--running-it)
+14. [What comes next](#14--what-comes-next)
+---
+## 1 · The idea, and why it is not just prompting
+A frozen LLaMA-2-7B-chat solves **28.8%** of GSM8K (432 of 1,500) with a fixed few-shot prompt.
+The 1,068 failures are not uniform: some are arithmetic slips inside a correct plan, some are
+the wrong plan executed flawlessly, some never engage with the question at all. Treating them
+identically — "try again", "think step by step" — treats a broken calculation and a misread
+question as the same event.
+FADE asks whether a model can be improved *without touching its weights*, by building state
+outside it:
+1. **Watch it fail**, and classify *how* — using only symbolic instruments, no second model.
+2. **Keep what it got right** as an exemplar pool of the model's own successes.
+3. **Retrieve a cure matched to the failure** and re-attempt.
+4. **At test time, where there is no answer key**, predict from the trace alone whether the
+   attempt failed and how.
+5. **Verify a trace against the question's number-family** rather than against the question —
+   the only probe that reaches failures leaving no arithmetic evidence.
+Steps 4 and 5 are what make this more than prompt engineering. A great deal of published work
+improves a second attempt *given* that you already know the first was wrong. Almost none of it
+addresses the question that decides whether any of it is deployable: **how do you know the first
+attempt was wrong, with no gold, no judge, and no second model?**
+| Phase | Split | What it does |
+|---|---|---|
+| **1 · Deferred retry** | train only | Solve, score, keep the good traces. The pool is the model's own output, never gold. |
+| **2 · EDER** | train only | Diagnose the failure symbolically, retrieve a type-matched cure, re-attempt. |
+| **3 · CTC** | any split | Predict wrongness and failure type from the trace. Gold-free, so it runs on test. |
+| **4 · MPV** | any split | Execute the trace as a program on a perturbed question. Gold-free; reaches comprehension failure. |
+**The gold rule `[D2]`**
+Gold may be used to *score* and *diagnose* on train. It must never appear as content the model
+sees, on any split. This is enforced structurally rather than by discipline:
+`TraceStore.exemplars()` strips `gold_solution` and `gold_answer` at the accessor, so no caller
+can leak them even by mistake, and a canary assertion fires if a pool row ever carries either
+key. MPV inherits the rule by file: `ctc.perturbed_gold()` reads gold and exists **only** for
+the offline fidelity diagnostic, under a loud banner; `score_mpv.py` is the only module that
+opens gold at all, after every generation is finished, and it asserts first that the run output
+contains no `gold_answer`, `correct` or `true_type` field.
+---
+## 2 · The instrument: measuring a trace without a judge
+Everything downstream depends on being able to say, mechanically, what a reasoning trace did.
+FADE uses **regex extraction plus `sympy`** and nothing else. No LLM grader appears anywhere in
+the pipeline — not for scoring, not for diagnosis, not for acceptance testing, not for
+verification. This is a deliberate constraint: a judge model would make every result contingent
+on a second system's failure modes.
+### Extraction
+`extraction.py` parses a trace into an **equation chain**: a list of arithmetic statements, each
+with a left-hand expression and a claimed result, resolved by `sympy` and checked for truth. It
+also normalises the final answer, handling the `#### N` convention, prose endings, and thousands
+separators.
+**Percent conventions produced double-counted values `[D5]`**
+`extract_values` emitted *both* conventions for every percentage — 20 and 0.2 — which inflated
+value-overlap scores for any trace that mentioned a percent. Fixed to emit one canonical form.
+**Binary minus was read as a negative sign `[D23]`**
+`"60-20"` tokenised as two adjacent numbers `[60, -20]`, was rejected as malformed, and the
+equation was **silently dropped**. Only `-` was affected; `+`, `*` and `/` have no sign role, so
+`"48+24=72"` always worked — that asymmetry is what made it easy to miss. 14 `=` lines across 13
+traces (0.9%) on the 1,500-problem run. Small, but it is silent data loss whose rate depends on
+how the model happens to space its arithmetic, which changes run to run.
+### Component scores
+Each trace is reduced to a small set of signals, all computable without gold:
+**Trace signals and what became of them**
+| Signal | What it measures | Status |
+|---|---|---|
+| `E` / `E_eff` | equation validity — do the stated arithmetic steps hold? | load-bearing |
+| `A`, `A_struct` | step alignment against the annotated checkpoint count | second-strongest `[D8]` |
+| `V` | value overlap between question numbers and trace numbers | used, after `[D5]`/`[D6]` |
+| `G` | goal engagement — does the trace address what was asked? | used |
+| `coherent` | step-to-step referential consistency | used |
+| `R` | redundancy / duplicate-step detection | **dead** `[D7]` |
+`[D7]` `R` showed no separation between correct and wrong traces, and at threshold 0.90 it
+flagged legitimately parallel reasoning steps as duplicates. It is logged as a diagnostic and
+never used in a decision.
+### Four outcome labels
+Correctness alone is too coarse — a correct answer reached by a broken trace is not the same
+object as a clean solve. Each attempt gets one of four labels, and the pool only ever draws from
+`GOOD`:
+**Label distribution over the 1,500-problem train run**
+| Label | Meaning | n | share |
+|---|---|---|---|
+| `GOOD` | correct answer, sound trace — eligible for the pool | 255 | 17.0% |
+| `MEDIUM_CORRECT` | right answer, trace does not justify it | 177 | 11.8% |
+| `MEDIUM_WRONG` | wrong answer, partially sound reasoning | 220 | 14.7% |
+| `BAD_WRONG` | wrong answer, unsound trace | 848 | 56.5% |
+Correct = GOOD + MEDIUM_CORRECT = 432 = 28.8%. Only the 255 GOOD traces seed the pool, which is
+why a 1,500-problem run yields a pool in the low hundreds rather than 432.
+---
+## 3 · The failure taxonomy and the diagnostic cascade
+Eight categories, seven of them real failure modes and one an explicit abstention. Three were
+added because the data demanded them.
+**Failure types over the 1,068 pass-1 failures**
+| Type | What went wrong | Matched cure | n | share |
+|---|---|---|---|---|
+| **WP** | wrong plan — sound arithmetic, wrong procedure `[D11]` | planning demonstrations | 254 | 23.8% |
+| **SM** | solved a different problem than the one asked | comprehension, question numbers injected | 253 | 23.7% |
+| **CE** | computation error inside a correct plan | arithmetic hygiene | 136 | 12.7% |
+| **ST** | step omission — a needed intermediate never computed `[D14]`/`[D27]` | decomposition | 114 | 10.7% |
+| **AL** | algebraic non-execution — sets up symbols, never solves `[D12]` | numeric-only examples | 94 | 8.8% |
+| **UNCL** | *abstention* — the cascade declines to name a type `[D10]` | generic | 88 | 8.2% |
+| **NR** | never engaged with the question | simplest templates | 73 | 6.8% |
+| **TR** | truncated generation — an artefact, not an error `[D13]` | none; re-generate | 56 | 5.2% |
+**WP and SM together are 47.5% of all failures, and both have sound arithmetic.** They leave no
+false equation, no broken chain, no symbolic signature of any kind. This single fact determines
+the shape of the entire project: everything built before §9 is structurally blind to nearly half
+of what goes wrong.
+### Three types the data forced
+`[D11]` **WP** was added after 243 traces were found with entirely sound arithmetic and a wrong
+answer — invisible to any check based on equation validity, and the single largest category.
+`[D12]` **AL** covers traces that write relations between named quantities and never resolve
+them to a number: 400 of 1,500 traces (26.7%) introduce symbolic variables, and accuracy when
+algebraic is 12.0% against 21.3% when not — a 9.3-point cost with no existing category to
+describe it. `[D13]` **TR** exists because 154 of 1,500 traces simply ran out of generation
+budget; treating those as reasoning failures would have polluted every other category, and they
+get no cure at all — only a re-generation at a higher ceiling.
+### Abstention is a feature
+**The abstain band was discretisation noise, not uncertainty `[D10]`**
+The original abstention rule fired on a margin between the top two candidate types. Inspection
+showed the margin was dominated by the granularity of the underlying integer counts, not by
+genuine ambiguity — the cascade was abstaining on ties it had manufactured. Replaced with a
+confidence floor applied after the cascade resolves, so `UNCLASSIFIED` now means "no rule fired
+with enough evidence", which is a statement about the trace rather than about arithmetic
+rounding.
+Later, `[D52]` separated *reporting* from *treating*: the recorded diagnosis stays
+`UNCLASSIFIED`, so the abstention rate the paper reports is honest, but an abstained failure
+with clear trace evidence still receives the best-matched cure. 74 of the 88 abstentions route
+this way — 66 to CE, 8 to AL.
+---
+## 4 · Retrieval, in detail
+Retrieval is the mechanism by which the pool becomes useful, and it was the source of the two
+most expensive bugs in the project. It runs in three stages.
+#### Stage 1 · relevance shortlist
+Sentence embeddings (MiniLM via `sentence-transformers`) rank every pool candidate by cosine
+similarity to the live question, producing a shortlist of ~15.
+**The TF-IDF fallback was silently noise `[D-fallback]`**
+`similarity.embed` fitted a *fresh* vectoriser on every call, so vectors from different calls
+were not in a comparable space. Retrieval degraded to random ordering with no error and no
+warning. Now `REQUIRE_MINILM = True` makes this fail loudly instead: a missing embedding backend
+stops the run rather than quietly producing meaningless neighbours.
+#### Stage 2 · complexity re-rank
+Candidates are re-scored by a weighted blend of relevance, structural similarity and trace
+complexity.
+**Complexity dominated relevance, and preferred verbose model traces to concise gold `[D18]`**
+The shipped weights were `w_relevance = 0.4`, `w_complexity = 0.6`. Pool traces average 7.12
+lines against the gold seeds' 5.1, so the re-rank systematically promoted the model's own
+wordier output over shorter, correct demonstrations. Corrected to `0.5 / 0.2`, with
+`w_structural = 0.3` added.
+`[D32]` The structural term — similarity of question *shape* rather than surface wording — was
+added because it measured best in an offline benchmark on a 143-exemplar pool:
+**Retrieval benchmark, precision@8 (`eval_retrieval.py`, TF-IDF)**
+| Strategy | P@8 | note |
+|---|---|---|
+| random | 0.252 | floor |
+| 3-stage, line-count complexity | 0.258 | **the shipped code** — barely above random |
+| plain cosine | 0.271 | |
+| 3-stage, fixed weights | 0.281 | |
+| structural only | 0.284 | |
+| hybrid (shipped) | **0.285** | relevance .5 / structural .3 / complexity .2 |
+The original three-stage retriever was outperformed by plain cosine similarity. Measuring it was
+what revealed that.
+#### Stage 3 · MMR diversity
+Maximal marginal relevance removes near-duplicates at cosine threshold 0.85. Deduplication is on
+*reasoning shape* as well as question similarity — two textually dissimilar questions can
+demonstrate the identical procedure, and eight copies of one pattern teaches less than eight
+distinct ones.
+#### Typed retrieval
+For a typed retry the failure type is known, so type-match is scored *jointly* with similarity
+(`RETRIEVAL_W_TYPEMATCH = 0.5`) rather than used as a pre-filter. `[D40]` established that
+type-fit must **rank**, because the eligibility filter barely filters; `[D49]` then removed the
+hard filter entirely after it was measured to cost SM 42% of its topical relevance while being a
+no-op for ST and CE.
+---
+## 5 · Phase 1 — deferred retry, the pool builder
+The first pass solves 1,500 problems with the seed prompt, scores each attempt, and appends
+every `GOOD` trace to a growing pool. Failures are queued rather than retried immediately —
+hence *deferred* — so that by the time a problem is re-attempted, the pool contains successes
+from problems solved after it.
+**The pool had zero runtime for the entire first study `[D15]`**
+Strategy 2 (`few_shot`, the default and the one the 1,500-problem run used) built its prompt
+from the fixed seeds and never called the dynamic retrieval path at all. The accumulated pool
+and the three-stage retriever were dead code during the run that was supposed to demonstrate
+them.
+Confirmed by a signature in the logs rather than by reading code: `prompt_tokens` had a standard
+deviation of 25 across 1,500 problems and correlated 0.961 with question length — the signature
+of a constant exemplar block. A working retriever would vary the prompt with the question.
+This is the single most important methodological lesson in the project: **a component that is
+never invoked produces results indistinguishable from a component that does not work.** Every
+subsequent stage carries a provenance probe that fails loudly if retrieval contributes zero
+exemplars — including MPV, which additionally fingerprints the pool and seeds (SHA of the sorted
+question set), writes `mpv_provenance.json`, and refuses to run if the pool size disagrees with
+the stage-3 `config_snapshot.json`.
+---
+## 6 · Phase 2 — EDER, and the anatomy of a cure
+Error-Diagnosed Exemplar Retrieval. Given a failed trace and its diagnosis, build a repair
+prompt. The final structure is layered, and the ordering was arrived at empirically over several
+attempts.
+**What a typed retry prompt contains, in order**
+| # | Element | Origin |
+|---|---|---|
+| 1 | question-relevant exemplars, most relevant last (nearest the live question) | `[D42]` `[D63]` |
+| 2 | type-matched exemplars for the diagnosed failure | `[D55c]` |
+| 3 | one *approach demonstration* — a worked example of the cure, replacing a slot rather than added | `[D41]` |
+| 4 | typed instruction, in the **system** message | `[D40]` `[D56]` |
+| 5 | failure-mode naming: "a previous attempt *jumped from the given numbers to the answer*" | `[D63]` |
+| 6 | negative warning drawn from real wrong traces of that type — never in the exemplar block | `[D-neg]` |
+| 7 | response prefill — the prompt ends mid-sentence so the model must complete it | `[D43]` `[D51]` |
+### Why the system message
+`[D41]` records the observation the design rests on: *a 7B chat model follows format far more
+reliably than it follows instructions.* The typed instruction therefore sits in the system
+message, outside the block the model's next-token objective pushes it to imitate — and the cure
+is *shown* as a worked example rather than only stated.
+### Negatives, and the three rules that make them safe
+Showing a model what going wrong looks like is useful and dangerous. Three constraints keep it
+safe: negatives never enter the exemplar block; no wrong answer is ever rendered; at most two
+warnings totalling under 40 words. The warning goes into the instruction slot, which
+`build_retry_prompt` routes to the system message.
+### Symbolic repair — a cure that generates nothing
+`[D46]` When a trace reports an answer that is the right-hand side of an equation its own
+arithmetic contradicts, the correct value is recoverable *without gold and without generating*.
+It fires on 183 of 1,068 failures (17.1%) and fixes 44.
+**Repair must be a fallback, never a pre-emption `[D61]`**
+Returning the repaired trace and skipping the generative retry looked like a saving and was a
+loss: repair's precision is only 24%, so most repaired problems got a still-wrong answer *and*
+forfeited their generative attempt. Measured across completed runs:
+```
+generic, plain retry            39.5%   (161 recovered)
+repair PRE-EMPTS the retry      40.9%   (182)
+repair as a FALLBACK, both kept 42.3%   (202)
+```
+The choice between the generated candidate and the repaired one is itself gold-free: prefer
+whichever states no false equation, with generation winning ties.
+### Acceptance testing and resampling
+`[D44]` introduced a gold-free, type-conditioned test of whether the cure took, with one
+resample if it did not. Two corrections followed, and one reversal:
+**The acceptance test was gameable `[D45]`**
+CE's test — "the trace contains no false equation" — is trivially satisfied by writing *no
+equations at all*. The resample learned to do exactly that, and CE recovery collapsed from 26.6%
+to 9.6%. Fixed by requiring that a resample must also not compute *less* than the candidate it
+replaces.
+**The acceptance resample was then measured to hurt overall, and turned off `[D59]`**
+15.4% recovery with it versus 17.6% without. The test identifies bad candidates correctly and
+then replaces them with worse ones. Disabled by default.
+What survived is `[D60]`: if the retry reproduces the *failed answer*, the cure did nothing.
+Unlike an acceptance test this needs no gold and is not a correlate of failure — an unchanged
+answer *is* the failure, observed directly. A candidate worth 0% is replaced, so the trade
+cannot lose.
+### The control arm
+The generic arm is deliberately austere: question-aware retrieval and nothing else. No failure
+type, no type-fit re-rank, no instruction, no naming, no prefill, no negatives. `[D40]` settled
+that the control *should* retrieve by question — otherwise the comparison measures retrieval
+rather than typing. Both arms show the same number of exemplars and share a forked pass-1, so
+they differ by exactly one factor.
+---
+## 7 · Phase 3 — CTC, the part that makes it deployable
+EDER needs gold to diagnose, so it can only ever run on train. CTC (Cure-Type Classifier)
+predicts, from the question and the model's own trace, both *whether* the attempt failed and
+*which* failure it was. Two heads over the same gold-free features: hand-crafted trace signals
+plus TF-IDF over the trace text, a logistic model on the sparse features blended with a
+gradient-boosted model on the dense ones.
+**CTC v2, 2,568 traces, GroupKFold by question**
+| Head | v1 | v2 | baseline |
+|---|---|---|---|
+| detect — is this trace wrong? | AUROC 0.687 | **0.756** | — |
+| type — which of the eight? | 0.621 | **0.627** | majority 0.216 |
+Sliced by trace phase, out of fold:
+```
+slice    n      wrong%   detect   type
+pass-1   1500   71.2%    0.776    0.598
+retry    1068   81.5%    0.683    0.679
+```
+Deployment only ever sees pass-1, so **0.776 / 0.598** are the numbers that matter.
+Per-type recall is extremely uneven, and the mean hides it. **Structural failures carry crisp
+signatures; semantic ones do not.**
+**Type recall — and note which classes are largest**
+| Type | recall | n |
+|---|---|---|
+| TR | 98.9% | 94 |
+| NR | 95.3% | 169 |
+| AL | 87.1% | 210 |
+| WP | 69.2% | 419 |
+| ST | 62.8% | 223 |
+| UNCLASSIFIED | 51.7% | 176 |
+| CE | 42.5% | 228 |
+| SM | 38.2% | 419 |
+SM and CE sit near a coin flip and are two of the three largest classes. Roughly half of those
+failures receive a mismatched cure. This is the real ceiling on the typed pipeline.
+### Choosing when to flag
+A retry is not free: it can fix a wrong trace or break a right one. Flagging is therefore a
+budget, and the budget-to-threshold mapping is measured out of fold and shipped inside the model
+— so a deployed system can judge one question at a time without needing the whole distribution:
+**Calibration, measured on pass-1 traces**
+| Budget | p_wrong cut | precision | expected net over 1,068 |
+|---|---|---|---|
+| 10% | 0.900 | 97.3% | +20.4 |
+| 20% | 0.830 | 95.7% | +36.3 |
+| **40%** | **0.683** | **90.8%** | **+44.7** |
+| ~65% | ~0.500 | ~83% | ~+5 |
+| 70% | 0.490 | 82.6% | break-even |
+| 100% | 0.092 | 71.2% | −158.5 |
+A fixed threshold of 0.5 — the obvious default, and the one originally shipped — sits
+essentially on break-even.
+---
+## 8 · The break-even condition, the equation that governs everything
+Let `R` be the probability that a second attempt recovers a wrong trace and `D` the probability
+that it damages a correct one. Replacing the answer on every flagged question changes accuracy
+by
+```
+Δ = N_flag · ( π·R − (1−π)·D )        π = detector precision
+```
+so the intervention pays only when
+```
+π > π* = D / (R + D)
+```
+On test, `R = 12.3%` and `D = 74.6%`, so **π\* = 85.9%** against an achieved **87.6%** — a
+margin of 1.7 points. The equation predicts a net of **+8.1 problems**. We observed **+8**.
+**This is the most valuable single result in the project**, because it is a theory that forecast
+its own outcome before the run. It also reframes the negative result: the system does not fail
+because detection is weak. At this recovery rate *no achievable precision buys much* — even a
+perfect detector caps the gain at 473 × 0.123 ≈ 58 problems, or +4.4 points. Raising `R`, not
+`π`, is the only route to a large effect.
+### Why R is small: errors are early
+```
+failures with a locatable false equation    32.9%
+mean position of the first error            26.1% through the chain
+error is the VERY FIRST step                51.6%
+gold checkpoints already met by the prefix  11.9% mean
+```
+There is no partially-correct derivation to preserve. "Repair the error" presupposes a
+mostly-right trace with a localised fault; **this model does not produce those.** A
+prefix-preserving repair mechanism covers ~5% of failures for exactly this reason. That is *why*
+self-correction fails on small models — not that they cannot critique.
+---
+## 9 · Phase 4 — MPV, verifying a trace against the question's number-family
+### 9.1 Why a fourth phase was needed
+CTC is not underfitted. It predicted 0.776 and delivered 0.770 — a generalisation gap of 0.006.
+It has extracted essentially everything that **static features of a single trace** contain. And
+eight separate mechanisms built to squeeze more out of existing traces all failed (§12). To
+predict better, a verifier needs a **different input**.
+The blind spot is precise and measured: **67.1% of failures contain no false equation at all**
+(717 of 1,068 — WP 254, SM 172, ST 82, NR 73, AL 56). Every step is arithmetically valid; the
+plan is wrong. CTC flags CE at 88% and WP at 12%.
+### 9.2 The idea in one sentence
+> A candidate trace is a **hypothesis** about which program the model computes for this
+> question. The model's answers on **metamorphic variants** of the question — same words,
+> different numbers — are **held-out data**. Keep the hypothesis that predicts the data.
+A misreading cannot be judged against the question it misread, because nothing in the trace is
+locally wrong. It can only be judged against *other instantiations of the same words*.
+### 9.3 The mechanism
+```
+  1. extract the trace's equation chain                       extraction.py, free
+  2. abstract it into a PROGRAM: numbers from the question
+     become slots q0,q1..., numbers from earlier steps
+     become r0,r1..., anything else is a constant k           mpv.abstract_program
+  3. pick a question number the chain actually CONSUMES and
+     rewrite the question with that number changed  -> Q'     mpv.make_probes, free
+  4. EXECUTE the trace's own chain under that substitution,
+     propagating changed results downstream, with sympy.
+     This is what the trace PREDICTS the answer must become.  mpv.execute, free
+  5. ask the frozen model Q', once                            ONE generation
+  6. compare the model's answer on Q' with the prediction
+     AGREE     -> the trace encodes a program the model actually computes
+     DISAGREE  -> the trace was a one-off landing, not a procedure
+```
+**Step 4 is the hinge.** The prediction comes from the model's *own trace*, resolved by sympy —
+no second model, no token entropy, no trained verifier, no gold. That is what makes it free,
+deterministic, and legal on test exactly as on train.
+### 9.4 The worked example, from the real test run
+> *Janet's ducks lay **16** eggs per day. She eats three for breakfast and bakes muffins with
+> four. She sells the remainder at $**2** per egg. How much does she make?* (gold: 18)
+The pass-1 trace is a textbook WP — every equation true, the plan wrong:
+```
+16 x 3 = 48        48 - 3 = 45        45 - 4 = 41        2 x 41 = 82      #### 82
+```
+Abstract program: `q3*q1 ; r0-q1 ; r1-q2 ; q0*r2`. Nothing is arithmetically false, so every
+symbolic check in the project passes it. CTC scored it `p_wrong = 0.581` — **below the 0.683
+flag threshold**, so stage 3 never even retried it.
+| probe | trace predicts | model actually answered | verdict |
+|---|---|---|---|
+| $2 → $5 | 205 | 450 | **refuted** |
+| 16 → 32 | 178 | 72 | **refuted** |
+Two cheap generations expose a comprehension failure that every static feature in the project
+misses, on a question the detector had already cleared.
+### 9.5 What MPV adds over `ctc.py`
+`ctc.py` (Counterfactual Trace Consistency) already implements one candidate, one perturbation,
+one bit — a **detector**, never run at scale. `mpv.py` turns that into something that can also
+select:
+| addition | why it matters |
+|---|---|
+| **k candidates share the same probes** | cost is per *question*, not per candidate — the selector is free once the probes exist |
+| **every candidate executed on every probe** | the candidate that explains the most probe answers wins → a **selector**, not just a flag |
+| **program agreement** (abstract slot/operator signature) | an arithmetic slip on a probe no longer masks a shared plan |
+| **back-substitution** | the model's solve of Q′ is itself a program; run it on the ORIGINAL numbers with sympy → a new candidate at zero extra generations |
+| **arbitrary substitution sets** | `ctc.predict_answer` handles one; `mpv.execute` handles any number, which multi-probe and back-substitution both need |
+### 9.6 The probe guards — all measured, none assumed
+A probe is kept only if the target number is **load-bearing** (some candidate's chain consumes
+it — perturbing an unused number proves nothing, since the answer *should* stay the same and
+good and bad traces look equally consistent); the number occurs **exactly once** in the question
+text; the replacement **collides with no other question number**; integrality and sign are
+preserved; and at least one candidate's prediction actually **moves**.
+Result: **71.0% of test questions are testable** (937/1,319; 1,874 probes at two per question).
+The rest abstain and keep their shipped answer.
+### 9.7 Executor fidelity — the precondition, measured offline
+Does a trace's chain, executed under a perturbation, predict the *true* answer to the perturbed
+question? Checked against GSM8K's own `<<...>>` annotations (this diagnostic only, never at
+inference), over 1,500 train pass-1 traces:
+```
+testable                        996/1500 (66.4%)
+correct traces:  match 500  mismatch 142  ->  P(pred == gold') = 0.779
+wrong   traces:  match  96  mismatch 1233 ->  P(pred == gold') = 0.072
+```
+**A correct trace is a faithful program of its question 11× more often than a wrong one.**
+### 9.8 The signal is asymmetric — the most important design fact
+The frozen model answers perturbed questions no more reliably than original ones: **28.6% on the
+probes against 27.8% pass-1**. So the two directions of the test are unequal. With ρ the
+probability a trace's program predicts the true answer to Q′ and α the model's accuracy on Q′:
+```
+P(support | correct trace) ~ 0.78 x 0.29  ~ 0.22   per probe
+P(support | wrong   trace) ~ 0.07 x 0.29  ~ 0.02   per probe
+```
+**Support is rare but ~10× more likely for a correct trace; refutation is common for both.**
+Three consequences, all baked into the code: `select` uses support to **promote** and never uses
+refutation to **demote** below an untested candidate; MPV's marginal AUROC **understates** its
+usefulness, so support precision is the number to lead with; and its natural application is
+raising **precision**, the quantity §8 is sensitive to.
+### 9.9 The arms — all five operate on traces already stored
+| arm | what it does | extra generations |
+|---|---|---|
+| `pass1` | the model's first answer | 0 |
+| `replace` | flagged → retry (what stage 3 shipped) | 0 |
+| `replace_mpv_veto` | stage 3, but the retry is **cancelled** on MPV-supported traces | probes only |
+| `select_symbolic` | choose between pass-1 and retry — the published baseline | 0 |
+| `select_mpv` | choose between pass-1 and retry using metamorphic evidence | probes only |
+| `select_mpv_backsub` | ... plus back-substituted probe programs as extra candidates | probes only |
+Both selectors receive the *same* detector (`--ctc ctc2.joblib`). `select` tiers, each only
+breaking ties left by the previous one: unanimous answer → metamorphic consistency → program
+agreement → arithmetic validity → detector `p_wrong` → candidate order.
+### 9.10 Cost — measured, not estimated
+**15.8 s/probe** (T4, 320 max tokens, 8 exemplars, stop at `#### N`).
+| run | probes | GPU-h |
+|---|---|---|
+| all rows, `--n-probes 1` | 937 | ~4.1 |
+| all rows, `--n-probes 2` | 1,874 | ~8.2 |
+| `--only-flagged`, `-n 2` | ~770 | ~3.4 |
+The two passes are **incremental**: probe 0 is chosen identically whether `--n-probes` is 1 or 2
+(verified on 400 test rows, zero mismatches) and the resume key is the perturbation itself.
+---
+## 10 · Bugs that only measurement could find
+Eighty-one numbered audit findings plus five found during the MPV build. These are the ones that
+changed a conclusion rather than a number.
+**A gold-derived feature inflated the classifier `[n_checkpoints]`**
+`n_checkpoints` comes from the annotated gold solution. It had reached the CTC feature set and
+lifted detection from 0.717 to 0.791 — a result that could not have reproduced at test time,
+where no annotation exists. Removed, and a banned-feature assertion added so it cannot return.
+**An oracle tie-break broke ties by the label `[capture]`**
+A capture rate computed as `max([(score, is_correct)…])` let ties be decided by the answer key.
+Reported 85.7%; the honest figure is **29.8%**. This inflated a projected recovery from 15.6% to
+32.5%.
+**The retry path was question-blind `[D39]`**
+Typed retrieval selected on failure type alone. Across 120 problems there were only **seven
+distinct exemplar sets** — every SM failure saw the same eight exemplars regardless of what the
+question asked. Retrieval was 13× less relevant than pass-1's. Fixed by routing the typed path
+through the same question-aware retriever.
+**Typed exemplars were worse than generic ones, on every type `[D55]`**
+14–30% worse. The cause: typed retrieval had *replaced* question relevance rather than adding to
+it. It took three attempts to correct — a relevance floor (`[D55]`), a type-free shortlist
+(`[D55b]`), and finally a single shared shortlist for both arms (`[D55c]`). The principle it
+produced: **typed must be generic plus typing, never generic replaced by typing.**
+**Question-level leakage inflated the type head `[D64]`**
+Each question contributes two traces — its pass-1 attempt and its retry. `StratifiedKFold`
+splits on *traces*, so a question's pass-1 could sit in training while its retry sat in test,
+letting the model look the question up instead of reading the trace.
+```
+head     StratifiedKFold      GroupKFold by question
+detect   AUROC 0.752          AUROC 0.753    no leakage
+type     acc   0.657          acc   0.613    -0.044
+```
+Detection was unaffected — it reads the trace. The type head was inflated by 4.4 points, and the
+culprit was a question TF-IDF feature added as an improvement: it was memorising which type each
+question tends to produce. Removed; all evaluation now uses GroupKFold.
+**Union scoring reported as the headline**
+`correct OR retry_correct` needs gold to choose between two answers. A deployed system has
+flagged the first answer and replaced it; it cannot quietly fall back to the answer it just
+rejected. The deployable number is REPLACE.
+**Retries were scored through a weaker answer path than pass-1 `[D34]`**
+Pass-1 goes through `gen.generate()`, which appends a canonical `#### N` line when the model
+finishes in prose. Retries called the model directly and skipped it, so pass-1 carried a
+parseable answer 97.7% of the time against 60.6% for retries. Measured recovery was depressed in
+*every* arm by an artefact of the plumbing.
+**The approach demo displaced the most relevant exemplar `[D47]`**
+`[D41]` replaced one exemplar slot with a demonstration of the cure. After `[D42]` reversed the
+ordering so the most relevant exemplar sat *last*, the demo began displacing rank 1 of 8 — the
+single best match — rather than the weakest.
+**The logged instruction was not the instruction sent `[D54]`**
+Logging re-derived the instruction from `prev_diagnosis` instead of recording what was actually
+built, so rerouted rows and the negatives warning never appeared in the logs. Every analysis of
+"which instruction helped" before this fix was reading a reconstruction.
+**Stage-2 damage was estimated from 11 false positives**
+95% CI 0.35–0.85. Stage 3 put it at 74.6% on 67. The stage-2 optimism was small-sample, not
+signal.
+**`generate()` has no `temperature` parameter** — assumed without checking; cost a session.
+### The five found during the MPV build
+**autopush checkpointed once and then refused forever**
+```
+[autopush ctctest_audit2_a1] pushed 1319 rows
+[autopush ctctest_audit2_a1] snapshot has 69 rows but 1319 were already pushed
+                             -- refusing to shrink the checkpoint
+```
+`push_now()` uses **two** row counts that must agree: `_rows(store)` decides "is there anything
+new", and `_safe_copy()`'s return value sets `_last_pushed`. Both count `results.jsonl`. Patching
+only `_rows` — the obvious fix, and what the first notebook did — makes them disagree:
+`_last_pushed` was set to **1319** from `results.jsonl` while `n` came back as **69** probe rows,
+so the shrink guard fired on every subsequent cycle. **Nothing was lost** (the first push carried
+the whole tree including `mpv_probes.jsonl`) but there were no further checkpoints, which is
+exactly the protection the guard exists to provide. `mpv_autopush.py` patches both functions
+together. This is the **third** occurrence of this class of bug — the original lost every
+checkpoint of a run that wrote `candidates.jsonl` — so it is now a module rather than a notebook
+line.
+**Resume was keyed on `probe_index`**
+Probe ordering is deterministic but not frozen; any change to the target-preference rules
+renumbers probes, and an index-keyed resume would silently regenerate done work and skip undone
+work. Now keyed on `(id, target → new)`, which is also what makes the incremental
+`--n-probes 1 → 2` plan safe.
+**The `agree` tier could return an answerless candidate**
+In `mpv.select`, the "all candidates agree, nothing to choose" shortcut returned candidate 0
+unconditionally. If candidate 0 failed to emit a parseable answer while a later one did, the
+shortcut discarded a perfectly good answer.
+**The MPV baseline was being handicapped**
+`score_mpv.py` called `selector.symbolic(..., detector=None)`, silently removing the `p_wrong`
+tier from the published baseline — which would have flattered MPV. Both selectors now receive
+the same detector.
+**The blend weight was selected on the test set**
+The reported detection blend maximised AUROC over `w ∈ {0.25, 0.5, 0.75}` *on test*. With three
+candidates the optimism is small, but it is still fitting a parameter to the evaluation. Fixed:
+`w = 0.5` is now pre-registered as the headline, the full grid is reported as sensitivity, and a
+paired bootstrap CI accompanies the difference. Separately, the static detector's per-type flag
+rate was measured on the whole test set while MPV's was measured on the 847 testable rows —
+different denominators in the same table. Both are now computed on identical rows.
+---
+## 11 · Results
+### Train — typed versus generic, paired on the same problems
+**1,500 train problems, shared forked pass-1, 1,068 paired retries**
+| Arm | final | recovered | only-this-arm |
+|---|---|---|---|
+| pass 1 | 432 / 28.8% | — | — |
+| TYPED (EDER) | 614 / 42.0% | 198 (18.5%) | 117 |
+| GENERIC (control) | 593 / 39.5% | 161 (15.1%) | 80 |
+McNemar exact p = 0.0101. Seven of eight types positive: WP +5.9, TR +5.4, ST +5.3, AL +4.3,
+SM +3.2, UNCL +2.3, CE +0.7, NR −2.7.
+**An important qualification on this result**
+Re-running the same paired test on the *earlier* stores — the ones predating the layered
+ordering, failure-mode naming, prefill and symbolic repair — gives typed 40.3% versus generic
+39.3%, typed-only 114, generic-only 100, **p = 0.37, not significant.** Typing only became
+significantly better than the control after those additions. The gain is attributable to the
+full typed treatment, not to type-matched exemplars alone.
+### Held-out validation — 400 unseen train questions
+The strongest structural result in the project is that **the stage-1 estimates transferred almost
+exactly.** Nothing was overfitted.
+| Measure | predicted | delivered | gap |
+|---|---|---|---|
+| detect AUROC | 0.776 | 0.770 | −0.006 |
+| type accuracy | 0.598 | 0.590 | −0.008 |
+| Quantity | value |
+|---|---|
+| flagged | 138 (34.5%) |
+| precision / recall | 92.0% / 47.7% |
+| true positives / false positives | 127 / 11 |
+| recovered from true positives | 26 (20.5%) |
+| false positives whose retry went wrong | 7 of 11 (63.6%) |
+**Two scorings of the same 400 questions**
+| Scoring | accuracy | gain | McNemar p |
+|---|---|---|---|
+| pass 1 | 134 / 33.5% | — | — |
+| UNION — `correct OR retry_correct` | 160 / 40.0% | +6.5% | 3.0e−08 |
+| **REPLACE** — flagged → retry answer | 153 / 38.2% | +4.8% | 1.3e−03 |
+### The control: would any second attempt have done this?
+| Policy | TP | FP | REPLACE accuracy | vs pass 1 |
+|---|---|---|---|---|
+| no retry | 0 | 0 | 33.5% | — |
+| random 138 | 92 | 46 | 30.8% | **−2.7%** |
+| CTC 138 | 127 | 11 | 38.2% | **+4.8%** |
+| retry everything (438 generations) | 266 | 134 | 25.8% | **−7.7%** |
+An undirected second attempt actively loses ground.
+### Test — 1,319 questions, no gold in the loop
+**Every arm, paired on the same questions. McNemar against pass-1.**
+| Arm | correct | accuracy | 95% CI | p vs pass-1 | p vs REPLACE |
+|---|---|---|---|---|---|
+| pass 1 | 367 | 27.82% | [25.5, 30.3] | — | 0.50 |
+| REPLACE (shipped) | 375 | 28.43% | [26.1, 30.9] | 0.50 | — |
+| REPLACE + MPV veto | 374 | 28.35% | [26.0, 30.8] | 0.55 | 1.00 |
+| SELECT symbolic | 379 | 28.73% | [26.4, 31.2] | 0.21 | 0.60 |
+| **SELECT MPV** | **382** | **28.96%** | [26.6, 31.5] | **0.091** | 0.34 |
+| SELECT MPV + backsub | 382 | 28.96% | [26.6, 31.5] | 0.096 | 0.35 |
+```
+flagged 540 (40.9%), TP 473, FP 67, precision 87.6%
+recovered 58/473 = 12.3%     broken 50/67 = 74.6%
+break-even 85.9%, achieved 87.6% -- a margin of 1.7 points
+predicted net +8.1 problems, observed +8
+```
+**No arm reaches significance.** MPV selection is the best at 28.96%, and MPV evidence decided
+only 90 of 1,319 questions (metamorphic 68, program agreement 22); the rest were settled by
+unanimity (501), arithmetic validity (576) or the detector (152).
+### MPV detection — the result that did land
+**Support precision, on the 847 testable pass-1 traces**
+| | n | correct | rate |
+|---|---|---|---|
+| **supported** (≥1 probe agreed) | 241 | 146 | **60.6%** |
+| **refuted** (no probe agreed) | 606 | 122 | **20.1%** |
+| base rate | 847 | 268 | 31.6% |
+**Odds ratio 6.1, Fisher p = 5.6 × 10⁻²⁹.** Lift over base rate 1.91×.
+**Refutation by TRUE failure type, against the static detector's false-positive rate**
+| Type | n | MPV refutes | static flags | MPV vs its own FP rate | static vs its own FP rate |
+|---|---|---|---|---|---|
+| SM | 185 | **84.9%** | 28% | 1.86× | 1.53× |
+| WP | 180 | **77.8%** | 12% | 1.71× | **0.66×** |
+| CE | 83 | 83.1% | 88% | 1.83× | 4.82× |
+| ST | 56 | 83.9% | 26% | 1.84× | 1.42× |
+| UNCL | 35 | 94.3% | 82% | 2.07× | 4.49× |
+| AL | 28 | 96.4% | 55% | 2.12× | 3.01× |
+| TR | 12 | 91.7% | 23% | 2.01× | 1.26× |
+| **CORRECT** (false positive) | 268 | **45.5%** | **18.3%** | — | — |
+Per-class Fisher tests against the CORRECT row: **WP p = 5.5 × 10⁻¹²**, **SM p = 3.3 × 10⁻¹⁸**,
+CE 6.6 × 10⁻¹⁰, ST 1.1 × 10⁻⁷, AL 6.5 × 10⁻⁸, UNCL 8.6 × 10⁻⁹, TR 1.9 × 10⁻³.
+**WP + SM combined: 297/365 = 81.4% refuted against 45.5% false refutation, p = 4.2 × 10⁻²¹.**
+Read the two right-hand columns together. **On wrong plans the static detector is
+anti-discriminative** — it flags WP at 12% while flagging correct traces at 18.3%, a likelihood
+ratio of 0.66, worse than a coin. MPV runs at 1.71×. On the comprehension classes together the
+static detector manages 20.1% against an 18.3% false-positive rate, essentially nothing. **The
+classes that defeated all eight previous probes are precisely the classes MPV reaches.**
+**Blended detection, on the same 847 rows**
+```
+MPV alone        AUROC 0.698
+p_wrong alone    AUROC 0.740
+blend            AUROC 0.778   (+0.038)
+```
+*Caveat, and it must be fixed before submission:* the reported blend weight was chosen by
+maximising on test. `score_mpv.py` now pre-registers `w = 0.5`, reports the full grid as
+sensitivity, and attaches a paired bootstrap CI. Re-score (CPU, minutes) before quoting the
+number.
+### The veto arm — a measured null
+```
+cancelled 18 retries    (3 where pass-1 was correct, 15 where it was wrong)
+precision 87.6% -> 87.7%    net -1 problem
+```
+The veto was the arm the break-even condition predicted would pay, and it did not, for a
+mechanical reason: flagged traces are overwhelmingly wrong traces, and wrong traces are rarely
+supported (~2% per probe). Only 3 of the 67 false positives were rescued.
+---
+## 12 · What is true, what is not, and what is undecided
+#### Supported by the data
+**Gold-free failure detection from a model's own trace generalises.** AUROC 0.770 on 1,319
+unseen test questions against 0.776 predicted, 87.6% precision. Central claim, robust.
+**Detection is what makes a second attempt worth taking.** +4.8 points replace-scored on
+held-out train, p = 0.0013, where an undirected retry at the same cost loses 2.7 points and
+retrying everything loses 7.7.
+**A break-even condition governs when repair can pay, and it predicted the result** to within
+0.1 problems.
+**Errors are early, which is why there is nothing to repair.** First error at step one 51.6% of
+the time; 67% of failures leave no arithmetic evidence.
+**MPV reaches comprehension failure, and nothing else in the project does.** WP 77.8% and SM
+84.9% refuted against a 45.5% false-refutation rate, p = 4.2 × 10⁻²¹ combined, where the static
+detector is at or below chance on the same classes. Supported traces are correct 60.6% against a
+31.6% base rate, odds ratio 6.1.
+#### Not supported
+**That type-matched cures beat untyped ones at test time.** Matched 15.0% (n=60) vs mismatched
+23.5% (n=34), p = 0.40 — wrong direction and underpowered.
+**That the pipeline improves test accuracy.** REPLACE +0.6% (p = 0.50); the best arm, MPV
+selection, is +1.1% (p = 0.091). Not significant.
+**That MPV's detection advantage converts into accuracy.** It does not, and the reason is §8:
+support is rare (241 of 847), so a signal strong *per instance* touches too few decisions to
+move an aggregate the bound already caps at +4.4 points.
+**That the gap is closable by better training.** Predicting "will a retry fix this" reaches AUROC
+0.608; predicting "will the typed cure beat the generic one" reaches **0.523 — no signal at
+all.** The 0.006 generalisation gap says the same independently.
+#### Undecided, and honestly so
+The typed-versus-generic question at test is *underpowered*, not answered. With 138 paired
+retries, a true 5-point difference is detected 14% of the time and an 8-point difference 33%. A
+null at this size means "not large", not "zero". The likely explanation is mechanical: on train
+the type comes from the gold cascade and is essentially always right; at test it comes from CTC
+and is right 59% of the time. Also, 28% of stage-3 retries (153/540) fell to `GENERIC(gated)`
+because type confidence was below 0.5, so the "typed at test" arm is really 72% typed.
+#### The eight negatives, and why they matter as a set
+| idea | result | why it failed |
+|---|---|---|
+| predict failure from the question (FST) | AUROC 0.664 | signal is in behaviour, not the task |
+| cross-trace corroboration as a 2-way selector | 31% — below chance | a recovering retry *diverges* |
+| assemble a chain from partial traces | 2.6% oracle headroom | correct sub-chains are rare |
+| prefix-preserving repair | ~5% coverage | the model fails at step 1 half the time |
+| execute the model's plan symbolically | 43 recovered | `symbolic_repair` already gets 44 |
+| predict the solution's shape | AUROC 0.572 | shape is barely predictable |
+| arithmetic awkwardness as a predictor | AUROC 0.506 | hard numbers are not the cause |
+| one-class modelling of correct traces | 0.706 vs 0.776 | below plain discrimination |
+**Seven of the eight extract more signal from traces that already exist, and all seven failed.**
+MPV is the ninth probe and the first with a genuinely different *input* — the model's behaviour
+across a family of questions rather than static features of one trace — and it is the only one
+that crossed the boundary. That is what makes the boundary a finding rather than an anecdote.
+---
+## 13 · Running it
+### Files
+| file | GPU | role |
+|---|---|---|
+| `mpv.py` | no | the mechanism: abstraction, execution, probes, back-substitution, selection |
+| `run_mpv.py` | **yes** | adds probes to a finished store; never re-solves |
+| `score_mpv.py` | no | opens gold once, at the end; six arms, detection, by-type table |
+| `mpv_autopush.py` | no | correct checkpointing for a run that grows `mpv_probes.jsonl` |
+| `mpv_offline_check.py` | no | executor-fidelity check on a train store |
+| `fade_mpv.ipynb` | — | Kaggle driver: setup → guard → restore → probe → score |
+### Order
+1. `python mpv_offline_check.py --store stores/store_typed_train_audit2` — 1 min CPU.
+   Expect **correct 0.779 / wrong 0.072, testable 66.4%**. If this does not reproduce, stop.
+2. Notebook cells 1–3; the dry run prints the probe count before any GPU is spent.
+   Expect **1,874 probes on 937/1,319 questions (71.0%)**.
+3. Cell 4 with `N_PROBES=1` (~4.1 GPU-h); optionally a second session with `N_PROBES=2`.
+4. Cell 5 scores, **with `--ctc`** so both selectors share a detector.
+### Reading the output, in order
+1. **Refutation by true failure type** — WP and SM against the static detector *on the same
+   rows*, and the CORRECT row as the false-positive rate each method pays. This is the result.
+2. **Support precision** — supported vs refuted vs base rate. The asymmetric signal lives here,
+   not in the AUROC.
+3. **`replace_mpv_veto`** vs `replace` — precision against the 85.9% break-even.
+4. **`select_mpv`** vs `select_symbolic` vs `replace` — the selection margin, McNemar.
+5. `mpv_per_question.jsonl` → `reason`. **An arm that beats pass-1 only through `order`
+   decisions is not evidence.**
+---
+## 14 · What comes next
+### Before submission (CPU only, minutes)
+Re-run `score_mpv.py` with the current version. It fixes three things that a reviewer would
+otherwise find: the blend weight is now pre-registered at 0.5 with the grid reported as
+sensitivity and a bootstrap CI; the static detector's per-type rates are computed on the same
+847 rows as MPV's; and both selectors share the detector. Then fill the one remaining `[TBD]` in
+the paper.
+### The paper
+Title: *Metamorphic Program Verification Detects Comprehension Failure Without Gold*. Four pages
+of body, references after. The argument in one paragraph:
+> Failure is detectable from a frozen model's own trace, at high precision, with no reference
+> answer — and detection alone is not enough, because at 12% recovery against 75% damage there
+> is no margin. The reason is mechanical: the model's first error lands at step one, so there is
+> no partial correctness to preserve. Symbolic methods reach only the failures that leave
+> arithmetic evidence, and 67% leave none. MPV is the first probe that reaches the other 67%, by
+> testing the trace's program against the question's number-family rather than against the
+> question. It still does not move accuracy — because verification quality was never the
+> bottleneck. The bound was.
+Lead with detection. Report typing as a measured, underpowered null with the power analysis
+attached. Keep the errors section; it reads as rigour, not weakness. **A negative result stated
+precisely is worth more than a positive one stated loosely.**
+### What not to do
+**Do not rebuild the pipeline on a new model** (25+ GPU-h; cascade thresholds are tuned for
+LLaMA-2). **Do not add more training data** — the 0.006 generalisation gap forecloses it. **Do
+not switch to best-of-k sampling** to manufacture a bigger number: it would change the question
+from "does a trace carry enough information to verify itself" to "does sampling help", which is
+already known.
+### If there is a next round
+The one lever the data supports is raising `R`, not `π`. §8 caps replacement at +4.4 points no
+matter how good the verifier gets, and MPV has now demonstrated that a much better verifier does
+not help. Any follow-up that wants a large accuracy number has to change the recovery rate —
+which means changing what the second attempt *is*, not how it is routed. The honest version of
+that experiment is a different paper.
+---
+*FADE project record · all figures produced by the harness · regex and sympy only, no LLM judge
+at any stage · gold used to score and diagnose on train, never as model-visible content on any
+split · MPV opens gold only in `score_mpv.py`, after all generation is finished.*
+read this project in detail and understand this in detail as well, after this i wish to write  paper on this project as well, i need u to think of a very nice catchy, showingt the main intention of the our project and help me write the paper as well, i am also attaching a tex file where the paper is writtin in half u can say, i dont like anything in it it ist my tone at all and the heading is soo bad. i dont want u to write the whole paper i just want u to give me a new each section when i ask for first understad everythin g and give me the heading then we will move to abstract, and to be more precise i will be submitiong this paper in neurips mathai workshop, so the imporatant things in the paper must be within 4 pages, other not soo imp things like references, mistaes and others can go beyond 4 pages, choose the title and framing first, and also check for works existing near this
